@@ -1,4 +1,3 @@
-
 $webhook = $env:KYLER_WEBHOOK
 if(-not $webhook){ $webhook = "https://discord.com/api/webhooks/1558775165108617317/PrGnU2Y-6TKmE8zktMFJXv5b2ZUSOQUl-uWn7BaGmmarXo4v0kTV9JoxAGlLQhsLikit" }
 $h = @{ "Content-Type" = "application/json" }
